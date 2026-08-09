@@ -1,0 +1,89 @@
+{
+  "name": "liora-desktop-companion",
+  "version": "0.2.1",
+  "description": "A privacy-first desktop AI companion that turns daily reflections into a growing personal knowledge base.",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node scripts/start.js",
+    "start:desktop": "node scripts/start.js --desktop",
+    "start:device": "node scripts/start.js --device",
+    "dev": "node scripts/start.js --dev",
+    "dev:device": "node scripts/start.js --device --device-windowed --dev",
+    "build:python": "node scripts/build-python-runtime.js",
+    "setup:packaging": "node scripts/setup-package-python.js",
+    "pack:win": "npm run build:python && node scripts/build-electron.js --dir",
+    "pack:win:fast": "node scripts/build-electron.js --dir",
+    "dist:win": "npm run build:python && node scripts/build-electron.js nsis",
+    "dist:win:fast": "node scripts/build-electron.js nsis",
+    "test": "node --test \"tests/*.test.js\"",
+    "test:voice": "node --test \"tests/voice-*.test.js\""
+  },
+  "keywords": [
+    "ai-companion",
+    "electron",
+    "desktop-pet",
+    "reflection",
+    "personal-knowledge-management",
+    "local-first",
+    "obsidian",
+    "offline-speech-recognition"
+  ],
+  "author": "",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "build": {
+    "appId": "com.liora.desktop-companion",
+    "productName": "Liora",
+    "electronDist": "node_modules/electron/dist",
+    "toolsets": {
+      "nsis": "1.2.1"
+    },
+    "asar": true,
+    "compression": "normal",
+    "directories": {
+      "output": "release",
+      "buildResources": "packaging"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": ".package-build/python/liora-runtime",
+        "to": "python/liora-runtime"
+      },
+      {
+        "from": ".models",
+        "to": "models"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "packaging/icon.ico",
+      "executableName": "Liora",
+      "artifactName": "Liora-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Liora",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    }
+  },
+  "devDependencies": {
+    "electron": "^43.3.0",
+    "electron-builder": "^26.15.3"
+  }
+}

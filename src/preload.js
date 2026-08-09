@@ -1,0 +1,45 @@
+const { contextBridge, ipcRenderer } = require('electron');
+
+function subscribe(channel, callback) {
+  const listener = (_event, ...args) => callback(...args);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
+contextBridge.exposeInMainWorld('liora', {
+  platformInfo: () => ipcRenderer.invoke('platform:get-info'),
+  weatherStatus: () => ipcRenderer.invoke('weather:get-status'),
+  setWeatherLocation: (location) => ipcRenderer.invoke('weather:set-location', location),
+  beginDrag: () => ipcRenderer.send('window:drag-start'),
+  moveDrag: () => ipcRenderer.send('window:drag-move'),
+  endDrag: () => ipcRenderer.send('window:drag-end'),
+  hide: () => ipcRenderer.send('window:hide'),
+  openMenu: () => ipcRenderer.send('tray:open-menu'),
+  setDialogOpen: (open) => ipcRenderer.invoke('dialog:set-open', open),
+  startReflection: (forceNew = false, knowledgeId = null) => ipcRenderer.invoke('reflection:start', forceNew, knowledgeId),
+  sendReflection: (sessionId, content) => ipcRenderer.invoke('reflection:send', sessionId, content),
+  finishReflection: (sessionId) => ipcRenderer.invoke('reflection:finish', sessionId),
+  confirmReflection: (sessionId) => ipcRenderer.invoke('reflection:confirm', sessionId),
+  discardReflection: (sessionId) => ipcRenderer.invoke('reflection:discard', sessionId),
+  reflectionHistory: () => ipcRenderer.invoke('reflection:history'),
+  knowledgeList: (options = {}) => ipcRenderer.invoke('knowledge:list', options),
+  knowledgeGet: (knowledgeId) => ipcRenderer.invoke('knowledge:get', knowledgeId),
+  knowledgeStorageStatus: () => ipcRenderer.invoke('knowledge:storage-status'),
+  chooseKnowledgeVault: () => ipcRenderer.invoke('knowledge:choose-vault'),
+  scanKnowledgeVault: () => ipcRenderer.invoke('knowledge:scan'),
+  rebuildKnowledgeVault: () => ipcRenderer.invoke('knowledge:rebuild'),
+  migrateKnowledgeToVault: () => ipcRenderer.invoke('knowledge:migrate'),
+  voiceStatus: () => ipcRenderer.invoke('voice:get-status'),
+  setDictation: (active) => ipcRenderer.invoke('voice:set-dictation', active),
+  onEnter: (callback) => subscribe('pet:enter', callback),
+  onOpenReflection: (callback) => subscribe('reflection:open', callback),
+  onVoiceStatus: (callback) => subscribe('voice:status', callback),
+  onVoiceWake: (callback) => subscribe('voice:wake', callback),
+  onVoiceProcessing: (callback) => subscribe('voice:processing', callback),
+  onVoiceCommand: (callback) => subscribe('voice:command', callback),
+  onVoiceClarify: (callback) => subscribe('voice:clarify', callback),
+  onVoiceTranscript: (callback) => subscribe('voice:transcript', callback),
+  onReminder: (callback) => subscribe('reminder:show', callback),
+  onWeather: (callback) => subscribe('weather:update', callback),
+  onRequestWeatherLocation: (callback) => subscribe('weather:request-location', callback)
+});

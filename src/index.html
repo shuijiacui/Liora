@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self' https://api.bigdatacloud.net; img-src 'self' data:; style-src 'self'; script-src 'self'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Liora</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main id="app" class="companion" data-view="idle">
+      <header id="device-status" class="device-status" aria-label="设备状态" hidden>
+        <div class="device-status__time">
+          <time id="device-clock">--:--</time>
+          <span id="device-date"></span>
+        </div>
+        <span class="device-status__name">Liora</span>
+      </header>
+
+      <nav id="feature-rail" class="feature-rail" aria-label="Liora 功能" aria-hidden="true">
+        <button class="feature-bubble" type="button" data-feature="reflection">反思</button>
+        <button class="feature-bubble" type="button" data-feature="knowledge">
+          知识<span id="knowledge-badge" class="feature-bubble__badge" hidden>+1</span>
+        </button>
+        <button class="feature-bubble" type="button" data-feature="weather">天气</button>
+      </nav>
+
+      <section id="interaction-bubble" class="interaction-bubble" aria-live="polite" hidden>
+        <header class="interaction-bubble__header">
+          <div class="interaction-bubble__identity">
+            <span id="interaction-kicker">LIORA</span>
+            <span id="model-status" class="model-status">连接中</span>
+          </div>
+          <button id="close-interaction" class="icon-button" type="button" aria-label="结束并返回">×</button>
+        </header>
+
+        <div id="interaction-content" class="interaction-content">
+          <p id="current-message" class="current-message"></p>
+
+          <div id="recording-state" class="recording-state" hidden>
+            <div class="recording-state__wave" aria-hidden="true">
+              <i></i><i></i><i></i><i></i><i></i>
+            </div>
+            <time id="recording-timer">00:00 / 01:00</time>
+          </div>
+
+          <section id="knowledge-browser" class="knowledge-browser" aria-label="知识搜索" hidden>
+            <form id="knowledge-search-form" class="knowledge-search">
+              <input
+                id="knowledge-search-input"
+                type="search"
+                maxlength="200"
+                placeholder="搜索标题、正文、标签……"
+                aria-label="搜索知识"
+              />
+              <button type="submit" aria-label="搜索">⌕</button>
+            </form>
+            <div class="knowledge-filters">
+              <select id="knowledge-folder-filter" aria-label="按文件夹筛选">
+                <option value="">全部文件夹</option>
+              </select>
+              <select id="knowledge-tag-filter" aria-label="按标签筛选">
+                <option value="">全部标签</option>
+              </select>
+              <select id="knowledge-sort" aria-label="知识排序">
+                <option value="relevance">最相关</option>
+                <option value="updated">最近更新</option>
+                <option value="title">标题排序</option>
+              </select>
+            </div>
+            <p id="knowledge-result-summary" class="knowledge-result-summary"></p>
+            <div id="knowledge-results" class="knowledge-results"></div>
+            <button id="knowledge-load-more" class="knowledge-load-more" type="button" hidden>加载更多</button>
+          </section>
+
+          <article id="knowledge-card" class="knowledge-card" hidden>
+            <h2 id="knowledge-title"></h2>
+            <p id="knowledge-core" class="knowledge-card__core"></p>
+            <ol id="knowledge-chain" class="knowledge-chain"></ol>
+            <div id="knowledge-questions" class="knowledge-questions" hidden>
+              <h3>还想继续弄清</h3>
+              <ul id="knowledge-question-list"></ul>
+            </div>
+            <p id="knowledge-next-step" class="knowledge-card__next"></p>
+            <p id="knowledge-meta" class="knowledge-card__meta"></p>
+          </article>
+
+          <div id="reflection-error" class="interaction-error" role="alert" hidden></div>
+        </div>
+
+        <form id="composer" class="composer" hidden>
+          <textarea
+            id="reflection-input"
+            rows="1"
+            maxlength="2000"
+            placeholder="写下你的想法……"
+            aria-label="反思内容"
+          ></textarea>
+          <button id="send-button" class="round-action round-action--primary" type="submit" aria-label="发送">↑</button>
+        </form>
+
+        <footer id="reflection-actions" class="bubble-actions" hidden>
+          <button id="microphone-button" class="bubble-action" type="button">
+            <span class="microphone-dot" aria-hidden="true"></span>
+            <span id="microphone-label">开始说</span>
+          </button>
+          <button id="finish-button" class="bubble-action bubble-action--quiet" type="button">先记到这里</button>
+        </footer>
+
+        <footer id="confirmation-actions" class="bubble-actions bubble-actions--wrap" hidden>
+          <button id="confirm-knowledge" class="bubble-action bubble-action--primary" type="button">这样保存</button>
+          <button id="continue-reflection" class="bubble-action" type="button">继续补充</button>
+          <button id="reorganize-knowledge" class="bubble-action bubble-action--quiet" type="button">重新整理</button>
+          <button id="discard-knowledge" class="bubble-action bubble-action--quiet" type="button">这次不保存</button>
+        </footer>
+
+        <footer id="discard-confirmation-actions" class="bubble-actions" hidden>
+          <button id="confirm-discard" class="bubble-action" type="button">确认不保存</button>
+          <button id="cancel-discard" class="bubble-action bubble-action--quiet" type="button">再看看</button>
+        </footer>
+
+        <footer id="knowledge-actions" class="bubble-actions" hidden>
+          <button id="back-to-knowledge" class="bubble-action bubble-action--quiet" type="button">返回结果</button>
+          <button id="extend-knowledge" class="bubble-action bubble-action--primary" type="button">继续感悟</button>
+        </footer>
+
+        <footer id="weather-actions" class="bubble-actions" hidden>
+          <button id="weather-location-button" class="bubble-action" type="button">使用当前位置</button>
+        </footer>
+      </section>
+
+      <button id="proactive-reminder" class="proactive-reminder" type="button" hidden>
+        <strong id="proactive-reminder-title"></strong>
+        <span id="proactive-reminder-body"></span>
+      </button>
+
+      <section id="pet" class="pet is-entering" aria-label="Liora 桌面伙伴">
+        <div class="pet__toolbar">
+          <span id="state-label" class="pet__state">待机</span>
+          <button id="hide-button" class="pet__button" type="button" title="隐藏到托盘" aria-label="隐藏到托盘">−</button>
+        </div>
+
+        <div id="character" class="pet__character" role="button" tabindex="0" aria-label="点击和 Liora 开始反思，拖动可移动">
+          <img id="sprite-current" class="pet__sprite is-visible" src="../assets/character/idle.png" alt="" draggable="false" />
+          <img id="sprite-next" class="pet__sprite" src="../assets/character/idle.png" alt="" draggable="false" />
+        </div>
+      </section>
+    </main>
+
+    <script src="./shared/pet-time-rules.js"></script>
+    <script src="./shared/location-name.js"></script>
+    <script src="./shared/voice-draft.js"></script>
+    <script src="./shared/knowledge-query.js"></script>
+    <script src="./renderer.js"></script>
+  </body>
+</html>

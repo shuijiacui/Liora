@@ -11,9 +11,15 @@ Thumbs.db
 
 # Node / Electron
 node_modules/
+.npm-cache/
+.models/
 dist/
 out/
 release/
+build/
+.package-build/
+.package-venv/
+tmp/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -35,6 +41,6 @@ htmlcov/
 *.db
 *.sqlite
 *.sqlite3
+*.sqlite3-*
 chroma/
 .chroma/
-
