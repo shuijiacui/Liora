@@ -57,6 +57,16 @@ class ReflectionApiTests(unittest.TestCase):
 
         draft = self.request(f"/api/reflections/{session_id}/finish", {})
         self.assertTrue(draft["awaiting_confirmation"])
+        edited_content = {
+            **draft["knowledge_draft"],
+            "title": "注意力机制知识",
+            "core_insight": "注意力的运行时权重由当前输入之间的关系动态决定。",
+        }
+        edited = self.request(
+            f"/api/reflections/{session_id}/draft",
+            {"content": edited_content},
+        )
+        self.assertEqual(edited["knowledge_draft"]["title"], "注意力机制知识")
         completed = self.request(f"/api/reflections/{session_id}/confirm", {})
         self.assertTrue(completed["complete"])
 

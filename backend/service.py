@@ -5,6 +5,15 @@ from database import ReflectionDatabase, utc_now
 from deepseek_client import DeepSeekClient, DeepSeekError
 from knowledge_store import KnowledgeVault
 from reflection_agent import START_PROMPT, follow_up, make_knowledge_draft
+from web_search import WebSearchClient, WebSearchError
+
+
+WEB_SEARCH_HINTS = (
+    "联网", "搜索", "查一下", "查证", "核实", "最新", "目前", "现在", "版本",
+    "政策", "法规", "价格", "数据", "统计", "论文", "研究", "是否正确", "准确吗",
+    "是不是", "不确定", "拿不准", "记不清",
+)
+EXPLICIT_WEB_HINTS = ("联网", "搜索", "查一下", "查证", "核实")
 
 
 class ReflectionService:
@@ -12,11 +21,13 @@ class ReflectionService:
         self,
         database: ReflectionDatabase,
         llm_client: DeepSeekClient | None = None,
+        search_client: WebSearchClient | None = None,
         vault_path: Path | None = None,
         data_dir: Path | None = None,
     ):
         self._database = database
         self._llm_client = llm_client
+        self._search_client = search_client
         self._data_dir = Path(data_dir) if data_dir else Path.cwd()
         self._vault: KnowledgeVault | None = None
         if vault_path:
@@ -28,6 +39,7 @@ class ReflectionService:
             "provider": "deepseek" if configured else "local",
             "model": self._llm_client.settings.model if configured else "local-reflection-agent",
             "configured": configured,
+            "web_search": bool(self._search_client and self._search_client.configured),
             "storage": self.storage_status(),
         }
 
@@ -109,9 +121,14 @@ class ReflectionService:
 
         provider = None
         notice = None
+        sources, search_notice = self._search_sources(content)
         if self._llm_client and self._llm_client.configured:
             try:
-                assistant_message = self._llm_client.generate_follow_up(messages, len(user_messages))
+                assistant_message = (
+                    self._llm_client.generate_follow_up(messages, len(user_messages), sources)
+                    if sources
+                    else self._llm_client.generate_follow_up(messages, len(user_messages))
+                )
                 provider = "deepseek"
             except DeepSeekError as error:
                 print(f"LIORA_DEEPSEEK_FALLBACK {error}", flush=True)
@@ -121,8 +138,14 @@ class ReflectionService:
         else:
             assistant_message = follow_up(content, len(user_messages))
             provider = "local"
+        if search_notice and any(word in content for word in EXPLICIT_WEB_HINTS):
+            assistant_message = f"我目前没能联网查证。基于已有知识，{assistant_message}"
+        notice = self._join_notices(notice, search_notice)
         self._database.add_message(session_id, "assistant", assistant_message)
-        return self._payload(session_id, provider=provider, notice=notice)
+        payload = self._payload(session_id, provider=provider, notice=notice)
+        payload["web_sources"] = sources
+        payload["web_used"] = bool(sources)
+        return payload
 
     def finish(self, session_id: str) -> dict:
         session = self._require_active_session(session_id)
@@ -137,9 +160,15 @@ class ReflectionService:
         )
         provider = None
         notice = None
+        search_text = self._knowledge_search_text(user_messages)
+        sources, search_notice = self._search_sources(search_text)
         if self._llm_client and self._llm_client.configured:
             try:
-                draft_content = self._llm_client.organize_knowledge(messages, existing)
+                draft_content = (
+                    self._llm_client.organize_knowledge(messages, existing, sources)
+                    if sources
+                    else self._llm_client.organize_knowledge(messages, existing)
+                )
                 provider = "deepseek"
             except DeepSeekError as error:
                 print(f"LIORA_DEEPSEEK_FALLBACK {error}", flush=True)
@@ -149,12 +178,67 @@ class ReflectionService:
         else:
             draft_content = make_knowledge_draft(user_messages, existing)
             provider = "local"
+        notice = self._join_notices(notice, search_notice)
         draft = self._database.save_knowledge_draft(
             session_id, draft_content, session.get("knowledge_id")
         )
         payload = self._payload(session_id, complete=False, provider=provider, notice=notice)
         payload["awaiting_confirmation"] = True
         payload["knowledge_draft"] = draft["content"]
+        payload["web_used"] = bool(sources)
+        return payload
+
+    def update_draft(self, session_id: str, content: dict) -> dict:
+        session = self._require_active_session(session_id)
+        existing_draft = self._database.get_knowledge_draft(session_id)
+        if existing_draft is None:
+            raise LookupError("没有找到待修改的知识草稿。")
+        try:
+            normalized = DeepSeekClient.normalize_knowledge(content)
+        except DeepSeekError as error:
+            raise ValueError(str(error)) from error
+        draft = self._database.save_knowledge_draft(
+            session_id,
+            normalized,
+            existing_draft.get("knowledge_id") or session.get("knowledge_id"),
+        )
+        payload = self._payload(session_id, complete=False)
+        payload["awaiting_confirmation"] = True
+        payload["knowledge_draft"] = draft["content"]
+        return payload
+
+    def revise_draft(self, session_id: str, instruction: str, content: dict | None = None) -> dict:
+        session = self._require_active_session(session_id)
+        instruction = " ".join(str(instruction or "").split()).strip()
+        if not instruction:
+            raise ValueError("请先写下希望 Liora 如何修改。")
+        if len(instruction) > 1200:
+            raise ValueError("修改意见请控制在 1200 字以内。")
+        stored = self._database.get_knowledge_draft(session_id)
+        if stored is None:
+            raise LookupError("没有找到待修改的知识草稿。")
+        if not self._llm_client or not self._llm_client.configured:
+            raise ValueError("请先配置 DeepSeek，才能让 Liora 按意见修改。")
+        try:
+            current = DeepSeekClient.normalize_knowledge(content or stored["content"])
+        except DeepSeekError as error:
+            raise ValueError(str(error)) from error
+
+        sources, search_notice = self._search_sources(f"{current['title']} {instruction}")
+        messages = self._database.get_messages(session_id)
+        try:
+            revised = self._llm_client.revise_knowledge(messages, current, instruction, sources)
+        except DeepSeekError as error:
+            raise ValueError(f"暂时无法按意见修改：{error}") from error
+        draft = self._database.save_knowledge_draft(
+            session_id,
+            revised,
+            stored.get("knowledge_id") or session.get("knowledge_id"),
+        )
+        payload = self._payload(session_id, complete=False, provider="deepseek", notice=search_notice)
+        payload["awaiting_confirmation"] = True
+        payload["knowledge_draft"] = draft["content"]
+        payload["web_used"] = bool(sources)
         return payload
 
     def confirm(self, session_id: str) -> dict:
@@ -232,7 +316,12 @@ class ReflectionService:
                     [
                         item.get("title", ""),
                         item.get("content", {}).get("core_insight", ""),
+                        *item.get("content", {}).get("key_points", []),
                         *item.get("content", {}).get("logic_chain", []),
+                        *item.get("content", {}).get("examples", []),
+                        *item.get("content", {}).get("extensions", []),
+                        *item.get("content", {}).get("boundaries", []),
+                        *item.get("content", {}).get("connections", []),
                         *item.get("content", {}).get("open_questions", []),
                         item.get("content", {}).get("next_step", ""),
                     ]
@@ -265,6 +354,32 @@ class ReflectionService:
 
     def history(self, limit: int = 20) -> dict:
         return {"sessions": self._database.list_sessions(limit)}
+
+    def _search_sources(self, text: str) -> tuple[list[dict], str | None]:
+        value = " ".join(str(text or "").split()).strip()
+        if not value or not any(word in value for word in WEB_SEARCH_HINTS):
+            return [], None
+        if not self._search_client or not self._search_client.configured:
+            if any(word in value for word in EXPLICIT_WEB_HINTS):
+                return [], "联网查证尚未配置，已使用模型已有知识继续。"
+            return [], None
+        try:
+            return self._search_client.search(value[:500]), None
+        except WebSearchError as error:
+            return [], f"联网查证暂时不可用：{error}"
+
+    @staticmethod
+    def _knowledge_search_text(user_messages: list[str]) -> str:
+        relevant = [
+            message for message in user_messages
+            if any(word in message for word in WEB_SEARCH_HINTS)
+        ]
+        return (relevant[-1] if relevant else "").strip()
+
+    @staticmethod
+    def _join_notices(first: str | None, second: str | None) -> str | None:
+        values = [value for value in (first, second) if value]
+        return "；".join(values) if values else None
 
     def _require_active_session(self, session_id: str) -> dict:
         session = self._database.get_session(session_id)

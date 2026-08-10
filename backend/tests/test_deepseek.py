@@ -69,10 +69,16 @@ class DeepSeekClientTests(unittest.TestCase):
         client = DeepSeekClient(settings)
         organized = {
             "title": "注意力理解",
-            "core_insight": "权重会随当前输入变化。",
+            "core_insight": "参数在训练后固定，但注意力分布仍会随当前输入变化。",
+            "key_points": ["参数与运行时权重不是同一概念", "输入决定当前注意力分布"],
             "logic_chain": ["读取当前输入", "计算相关性", "形成动态权重"],
+            "examples": ["同一个词在不同句子中会关注不同上下文。"],
+            "extensions": ["这种动态性可以用于建立与动态卷积的有限类比。"],
+            "boundaries": ["不能说模型参数会在每次推理时重新训练。"],
+            "connections": ["与动态卷积都具有输入相关的计算行为。"],
             "open_questions": ["不同头如何分工？"],
             "next_step": "用一个小例子手算权重。",
+            "sources": [],
         }
         response = FakeResponse(
             {"choices": [{"message": {"role": "assistant", "content": json.dumps(organized, ensure_ascii=False)}}]}
@@ -84,6 +90,39 @@ class DeepSeekClientTests(unittest.TestCase):
             )
 
         self.assertEqual(result, organized)
+
+    def test_revise_knowledge_uses_current_draft_and_instruction(self) -> None:
+        settings = DeepSeekSettings(
+            api_key="test-secret",
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-flash",
+            timeout_seconds=5,
+        )
+        client = DeepSeekClient(settings)
+        current = {
+            "title": "注意力理解",
+            "core_insight": "注意力权重随输入变化。",
+            "key_points": ["权重是动态的"],
+            "logic_chain": ["输入", "权重"],
+            "examples": [],
+            "extensions": [],
+            "boundaries": [],
+            "connections": [],
+            "open_questions": [],
+            "next_step": "",
+            "sources": [],
+        }
+        revised = {**current, "examples": ["同一个词在不同上下文中得到不同权重。"]}
+        response = FakeResponse(
+            {"choices": [{"message": {"role": "assistant", "content": json.dumps(revised, ensure_ascii=False)}}]}
+        )
+
+        with patch("deepseek_client.urlopen", return_value=response) as mocked_urlopen:
+            result = client.revise_knowledge([], current, "增加一个例子")
+
+        self.assertEqual(result["examples"], revised["examples"])
+        body = json.loads(mocked_urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertIn("增加一个例子", body["messages"][-1]["content"])
 
 
 if __name__ == "__main__":

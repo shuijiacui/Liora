@@ -8,7 +8,8 @@ const {
   ipcMain,
   nativeImage,
   screen,
-  session
+  session,
+  shell
 } = require('electron');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
@@ -999,9 +1000,10 @@ async function backendRequest(method, requestPath, payload) {
   await backendReady;
   const body = payload === undefined ? null : Buffer.from(JSON.stringify(payload));
   const aiRequest = requestPath.endsWith('/finish')
+    || requestPath.endsWith('/revise')
     || requestPath.includes('/messages')
     || requestPath === '/api/voice/command-transcript';
-  const requestTimeout = aiRequest ? 45_000 : 8_000;
+  const requestTimeout = aiRequest ? 75_000 : 8_000;
   return new Promise((resolve, reject) => {
     const request = http.request(
       {
@@ -1146,6 +1148,17 @@ function registerIpc() {
     if (!isPetSender(event)) throw new Error('unauthorized');
     return backendRequest('POST', `/api/reflections/${encodeURIComponent(sessionId)}/finish`, {});
   });
+  ipcMain.handle('reflection:update-draft', (event, sessionId, content) => {
+    if (!isPetSender(event)) throw new Error('unauthorized');
+    return backendRequest('POST', `/api/reflections/${encodeURIComponent(sessionId)}/draft`, { content });
+  });
+  ipcMain.handle('reflection:revise-draft', (event, sessionId, content, instruction) => {
+    if (!isPetSender(event)) throw new Error('unauthorized');
+    return backendRequest('POST', `/api/reflections/${encodeURIComponent(sessionId)}/revise`, {
+      content,
+      instruction
+    });
+  });
   ipcMain.handle('reflection:confirm', (event, sessionId) => {
     if (!isPetSender(event)) throw new Error('unauthorized');
     return backendRequest('POST', `/api/reflections/${encodeURIComponent(sessionId)}/confirm`, {});
@@ -1157,6 +1170,13 @@ function registerIpc() {
   ipcMain.handle('reflection:history', (event) => {
     if (!isPetSender(event)) throw new Error('unauthorized');
     return backendRequest('GET', '/api/reflections?limit=20');
+  });
+  ipcMain.handle('knowledge:open-source', async (event, value) => {
+    if (!isPetSender(event)) throw new Error('unauthorized');
+    const url = new URL(String(value || ''));
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('不支持的来源链接。');
+    await shell.openExternal(url.toString());
+    return { ok: true };
   });
   ipcMain.handle('knowledge:list', (event, options = {}) => {
     if (!isPetSender(event)) throw new Error('unauthorized');

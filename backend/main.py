@@ -7,11 +7,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from config import DeepSeekSettings
+from config import DeepSeekSettings, WebSearchSettings
 from database import ReflectionDatabase
 from deepseek_client import DeepSeekClient
 from service import ReflectionService
 from voice_transcriber import VoiceTranscriber
+from web_search import WebSearchClient
 
 
 def format_voice_event(payload: dict) -> str:
@@ -64,7 +65,10 @@ class ReflectionHandler(BaseHTTPRequestHandler):
 
         try:
             route = urlparse(self.path).path
-            body = self._read_json(1_048_576 if route == "/api/voice/command-transcript" else 16_384)
+            maximum = 1_048_576 if route == "/api/voice/command-transcript" else 16_384
+            if route.endswith(("/draft", "/revise")):
+                maximum = 131_072
+            body = self._read_json(maximum)
             if route == "/api/reflections/start":
                 return self._json(
                     200,
@@ -112,6 +116,20 @@ class ReflectionHandler(BaseHTTPRequestHandler):
                     return self._json(200, self.server.service.reply(session_id, str(body.get("content", ""))))
                 if action == "finish":
                     return self._json(200, self.server.service.finish(session_id))
+                if action == "draft":
+                    return self._json(
+                        200,
+                        self.server.service.update_draft(session_id, body.get("content") or {}),
+                    )
+                if action == "revise":
+                    return self._json(
+                        200,
+                        self.server.service.revise_draft(
+                            session_id,
+                            str(body.get("instruction") or ""),
+                            body.get("content") if isinstance(body.get("content"), dict) else None,
+                        ),
+                    )
                 if action == "confirm":
                     return self._json(200, self.server.service.confirm(session_id))
                 if action == "discard":
@@ -165,9 +183,11 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     database = ReflectionDatabase(Path(args.data_dir) / "liora.sqlite3")
     settings = DeepSeekSettings.from_project(project_root)
+    search_settings = WebSearchSettings.from_project(project_root)
     service = ReflectionService(
         database,
         DeepSeekClient(settings),
+        search_client=WebSearchClient(search_settings),
         vault_path=Path(args.vault_path) if args.vault_path else None,
         data_dir=Path(args.data_dir),
     )

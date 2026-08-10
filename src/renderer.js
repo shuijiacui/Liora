@@ -28,18 +28,36 @@ const recordingTimer = document.querySelector('#recording-timer');
 const confirmationActions = document.querySelector('#confirmation-actions');
 const confirmKnowledgeButton = document.querySelector('#confirm-knowledge');
 const continueReflectionButton = document.querySelector('#continue-reflection');
-const reorganizeKnowledgeButton = document.querySelector('#reorganize-knowledge');
+const editKnowledgeButton = document.querySelector('#edit-knowledge');
 const discardKnowledgeButton = document.querySelector('#discard-knowledge');
+const draftEditor = document.querySelector('#draft-editor');
+const draftEditorActions = document.querySelector('#draft-editor-actions');
+const saveDraftButton = document.querySelector('#save-draft');
+const reviseDraftButton = document.querySelector('#revise-draft');
+const cancelDraftEditButton = document.querySelector('#cancel-draft-edit');
+const draftFeedbackInput = document.querySelector('#draft-feedback-input');
+const draftFields = {
+  title: document.querySelector('#draft-title'),
+  core_insight: document.querySelector('#draft-core'),
+  key_points: document.querySelector('#draft-key-points'),
+  logic_chain: document.querySelector('#draft-logic-chain'),
+  examples: document.querySelector('#draft-examples'),
+  extensions: document.querySelector('#draft-extensions'),
+  boundaries: document.querySelector('#draft-boundaries'),
+  connections: document.querySelector('#draft-connections'),
+  open_questions: document.querySelector('#draft-open-questions'),
+  next_step: document.querySelector('#draft-next-step')
+};
 const discardConfirmationActions = document.querySelector('#discard-confirmation-actions');
 const confirmDiscardButton = document.querySelector('#confirm-discard');
 const cancelDiscardButton = document.querySelector('#cancel-discard');
 const knowledgeCard = document.querySelector('#knowledge-card');
 const knowledgeTitle = document.querySelector('#knowledge-title');
 const knowledgeCore = document.querySelector('#knowledge-core');
-const knowledgeChain = document.querySelector('#knowledge-chain');
-const knowledgeQuestions = document.querySelector('#knowledge-questions');
-const knowledgeQuestionList = document.querySelector('#knowledge-question-list');
+const knowledgeSections = document.querySelector('#knowledge-sections');
 const knowledgeNextStep = document.querySelector('#knowledge-next-step');
+const knowledgeSources = document.querySelector('#knowledge-sources');
+const knowledgeSourceList = document.querySelector('#knowledge-source-list');
 const knowledgeMeta = document.querySelector('#knowledge-meta');
 const knowledgeBrowser = document.querySelector('#knowledge-browser');
 const knowledgeSearchForm = document.querySelector('#knowledge-search-form');
@@ -174,7 +192,8 @@ function restoreIdleState() {
 
 function updateProvider(payload) {
   const labels = { deepseek: 'DeepSeek', local: '本地', 'local-fallback': '本地降级' };
-  modelStatus.textContent = labels[payload?.provider] || '本地';
+  const providerLabel = labels[payload?.provider] || '本地';
+  modelStatus.textContent = payload?.web_used ? `${providerLabel} · 联网` : providerLabel;
   modelStatus.title = payload?.notice || payload?.model || '';
 }
 
@@ -218,6 +237,8 @@ function setView(view) {
   setHidden(reflectionActions, view !== 'reflection');
   setHidden(confirmationActions, view !== 'confirmation' || discardConfirming);
   setHidden(discardConfirmationActions, view !== 'confirmation' || !discardConfirming);
+  setHidden(draftEditorActions, view !== 'draft-edit');
+  setHidden(draftEditor, view !== 'draft-edit');
   setHidden(knowledgeBrowser, view !== 'knowledge' || Boolean(selectedKnowledge));
   setHidden(knowledgeActions, view !== 'knowledge' || !selectedKnowledge);
   setHidden(weatherActions, view !== 'weather');
@@ -234,31 +255,97 @@ function showMessage(text, kicker = 'LIORA') {
   currentMessage.hidden = false;
   knowledgeBrowser.hidden = true;
   knowledgeCard.hidden = true;
+  draftEditor.hidden = true;
 }
 
 function renderKnowledgeContent(content, meta = '') {
   const safe = content || {};
   currentMessage.hidden = true;
   knowledgeBrowser.hidden = true;
+  draftEditor.hidden = true;
   knowledgeCard.hidden = false;
   knowledgeTitle.textContent = safe.title || '未命名知识';
   knowledgeCore.textContent = safe.core_insight || '';
-  knowledgeChain.replaceChildren();
-  for (const item of safe.logic_chain || []) {
-    const row = document.createElement('li');
-    row.textContent = item;
-    knowledgeChain.appendChild(row);
+  knowledgeSections.replaceChildren();
+  const sections = [
+    ['关键要点', 'key_points', false],
+    ['原理与推理', 'logic_chain', true],
+    ['例子与反例', 'examples', false],
+    ['延伸理解', 'extensions', false],
+    ['边界与误区', 'boundaries', false],
+    ['知识联系', 'connections', false],
+    ['尚待探索', 'open_questions', false]
+  ];
+  for (const [title, key, ordered] of sections) {
+    const values = safe[key] || [];
+    if (!values.length) continue;
+    const section = document.createElement('section');
+    section.className = 'knowledge-section';
+    const heading = document.createElement('h3');
+    heading.textContent = title;
+    const list = document.createElement(ordered ? 'ol' : 'ul');
+    for (const item of values) {
+      const row = document.createElement('li');
+      row.textContent = item;
+      list.appendChild(row);
+    }
+    section.append(heading, list);
+    knowledgeSections.appendChild(section);
   }
-  knowledgeQuestionList.replaceChildren();
-  for (const item of safe.open_questions || []) {
-    const row = document.createElement('li');
-    row.textContent = item;
-    knowledgeQuestionList.appendChild(row);
-  }
-  knowledgeQuestions.hidden = knowledgeQuestionList.children.length === 0;
   knowledgeNextStep.textContent = safe.next_step ? `下一步：${safe.next_step}` : '';
   knowledgeNextStep.hidden = !safe.next_step;
+  knowledgeSourceList.replaceChildren();
+  for (const source of safe.sources || []) {
+    const row = document.createElement('li');
+    if (source.url) {
+      const link = document.createElement('button');
+      link.className = 'knowledge-source-link';
+      link.type = 'button';
+      link.textContent = source.title || source.url;
+      link.title = source.url;
+      link.addEventListener('click', () => void window.liora.openKnowledgeSource(source.url));
+      row.appendChild(link);
+    } else {
+      row.textContent = source.title || '参考资料';
+    }
+    knowledgeSourceList.appendChild(row);
+  }
+  knowledgeSources.hidden = knowledgeSourceList.children.length === 0;
   knowledgeMeta.textContent = meta;
+}
+
+function linesToText(items) {
+  return (items || []).join('\n');
+}
+
+function textToLines(value) {
+  return String(value || '').split(/\r?\n/u).map((item) => item.trim()).filter(Boolean);
+}
+
+function fillDraftEditor(content) {
+  const safe = content || {};
+  draftFields.title.value = safe.title || '';
+  draftFields.core_insight.value = safe.core_insight || '';
+  for (const key of ['key_points', 'logic_chain', 'examples', 'extensions', 'boundaries', 'connections', 'open_questions']) {
+    draftFields[key].value = linesToText(safe[key]);
+  }
+  draftFields.next_step.value = safe.next_step || '';
+}
+
+function draftFromEditor() {
+  return {
+    title: draftFields.title.value.trim(),
+    core_insight: draftFields.core_insight.value.trim(),
+    key_points: textToLines(draftFields.key_points.value),
+    logic_chain: textToLines(draftFields.logic_chain.value),
+    examples: textToLines(draftFields.examples.value),
+    extensions: textToLines(draftFields.extensions.value),
+    boundaries: textToLines(draftFields.boundaries.value),
+    connections: textToLines(draftFields.connections.value),
+    open_questions: textToLines(draftFields.open_questions.value),
+    next_step: draftFields.next_step.value.trim(),
+    sources: pendingKnowledgeDraft?.sources || []
+  };
 }
 
 function setBusy(value) {
@@ -269,7 +356,10 @@ function setBusy(value) {
   microphoneButton.disabled = value || !voiceState.available || voiceState.stage === 'transcribing';
   confirmKnowledgeButton.disabled = value;
   continueReflectionButton.disabled = value;
-  reorganizeKnowledgeButton.disabled = value;
+  editKnowledgeButton.disabled = value;
+  saveDraftButton.disabled = value;
+  reviseDraftButton.disabled = value;
+  cancelDraftEditButton.disabled = value;
   discardKnowledgeButton.disabled = value;
   confirmDiscardButton.disabled = value;
   cancelDiscardButton.disabled = value;
@@ -318,8 +408,8 @@ function applyReflection(payload) {
     pendingKnowledgeDraft = payload.knowledge_draft;
     discardConfirming = false;
     setView('confirmation');
-    interactionKicker.textContent = '整理好的知识';
-    renderKnowledgeContent(payload.knowledge_draft, '确认后才会正式保存');
+    interactionKicker.textContent = '知识文件草稿';
+    renderKnowledgeContent(payload.knowledge_draft, '可以直接编辑，也可以告诉 Liora 如何修改');
     setState('thinking');
     return;
   }
@@ -371,7 +461,7 @@ async function finishReflection() {
   if (!sessionId || busy || voiceState.listening) return;
   setBusy(true);
   showError();
-  showMessage('正在把整段对话连成一条清晰的逻辑…');
+  showMessage('正在围绕核心主题构建一份完整的知识文件…');
   setState('thinking');
   try {
     applyReflection(await window.liora.finishReflection(sessionId));
@@ -404,9 +494,75 @@ function continueReflection() {
   discardConfirming = false;
   pendingKnowledgeDraft = null;
   setView('reflection');
-  showMessage('你可以继续补充，我会等你说完后再重新整理。');
+  showMessage('你可以继续聊。我会用新的理解重新构建知识文件。');
   setState('asking');
   input.focus();
+}
+
+function openDraftEditor() {
+  if (!pendingKnowledgeDraft || busy) return;
+  discardConfirming = false;
+  setView('draft-edit');
+  currentMessage.hidden = true;
+  knowledgeCard.hidden = true;
+  knowledgeBrowser.hidden = true;
+  draftEditor.hidden = false;
+  interactionKicker.textContent = '编辑知识文件';
+  fillDraftEditor(pendingKnowledgeDraft);
+  draftFeedbackInput.value = '';
+  draftFields.title.focus();
+}
+
+function showDraftPreview() {
+  if (!pendingKnowledgeDraft || busy) return;
+  setView('confirmation');
+  interactionKicker.textContent = '知识文件草稿';
+  renderKnowledgeContent(pendingKnowledgeDraft, '可以直接编辑，也可以告诉 Liora 如何修改');
+}
+
+async function saveDraft() {
+  if (!sessionId || busy) return;
+  const content = draftFromEditor();
+  if (!content.title || !content.core_insight || (!content.key_points.length && !content.logic_chain.length)) {
+    showError('请至少保留标题、核心理解，以及关键要点或推理过程。');
+    return;
+  }
+  setBusy(true);
+  showError();
+  try {
+    applyReflection(await window.liora.updateReflectionDraft(sessionId, content));
+  } catch (error) {
+    showError(error.message || '草稿修改暂时没有保存成功。');
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function reviseDraft() {
+  if (!sessionId || busy) return;
+  const instruction = draftFeedbackInput.value.trim();
+  if (!instruction) {
+    showError('先告诉 Liora 希望怎样修改这份知识文件。');
+    draftFeedbackInput.focus();
+    return;
+  }
+  const content = draftFromEditor();
+  setBusy(true);
+  showError();
+  showMessage('正在根据你的意见修改知识文件…', 'LIORA');
+  setState('thinking');
+  try {
+    applyReflection(await window.liora.reviseReflectionDraft(sessionId, content, instruction));
+  } catch (error) {
+    showError(error.message || '暂时无法按意见修改。');
+    setView('draft-edit');
+    draftEditor.hidden = false;
+    fillDraftEditor(content);
+    draftFeedbackInput.value = instruction;
+    setState('asking');
+  } finally {
+    setBusy(false);
+  }
 }
 
 function askToDiscardKnowledge() {
@@ -421,8 +577,8 @@ function cancelDiscardKnowledge() {
   if (busy || !pendingKnowledgeDraft) return;
   discardConfirming = false;
   setView('confirmation');
-  interactionKicker.textContent = '整理好的知识';
-  renderKnowledgeContent(pendingKnowledgeDraft, '确认后才会正式保存');
+  interactionKicker.textContent = '知识文件草稿';
+  renderKnowledgeContent(pendingKnowledgeDraft, '可以直接编辑，也可以告诉 Liora 如何修改');
   setState('thinking');
 }
 
@@ -807,7 +963,17 @@ microphoneButton.addEventListener('click', async () => {
 finishButton.addEventListener('click', finishReflection);
 confirmKnowledgeButton.addEventListener('click', confirmKnowledge);
 continueReflectionButton.addEventListener('click', continueReflection);
-reorganizeKnowledgeButton.addEventListener('click', finishReflection);
+editKnowledgeButton.addEventListener('click', openDraftEditor);
+saveDraftButton.addEventListener('click', saveDraft);
+reviseDraftButton.addEventListener('click', reviseDraft);
+cancelDraftEditButton.addEventListener('click', showDraftPreview);
+draftEditor.addEventListener('submit', (event) => event.preventDefault());
+document.querySelectorAll('[data-draft-suggestion]').forEach((button) => {
+  button.addEventListener('click', () => {
+    draftFeedbackInput.value = button.dataset.draftSuggestion || '';
+    draftFeedbackInput.focus();
+  });
+});
 discardKnowledgeButton.addEventListener('click', askToDiscardKnowledge);
 confirmDiscardButton.addEventListener('click', discardKnowledge);
 cancelDiscardButton.addEventListener('click', cancelDiscardKnowledge);

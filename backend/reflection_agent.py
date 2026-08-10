@@ -67,7 +67,13 @@ def make_knowledge_draft(user_messages: list[str], existing: dict | None = None)
     return {
         "title": title,
         "core_insight": core_insight,
+        "key_points": chain[-6:],
         "logic_chain": chain[-6:],
+        "examples": [],
+        "extensions": [],
+        "boundaries": [],
+        "connections": [],
         "open_questions": uncertain[-3:],
         "next_step": "之后遇到新的例子时，继续补充和验证这条理解。",
+        "sources": [],
     }

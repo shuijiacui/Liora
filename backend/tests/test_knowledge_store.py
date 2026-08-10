@@ -9,7 +9,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
 from database import ReflectionDatabase
-from knowledge_store import KnowledgeVault
+from knowledge_store import KnowledgeVault, parse_markdown, render_knowledge_markdown
 from service import ReflectionService
 
 
@@ -25,6 +25,42 @@ class KnowledgeVaultTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.database.close()
         self.temporary.cleanup()
+
+    def test_rich_knowledge_sections_and_sources_round_trip_through_markdown(self) -> None:
+        content = {
+            "title": "动态注意力",
+            "core_insight": "参数固定不等于运行时权重固定。",
+            "key_points": ["输入参与权重计算"],
+            "logic_chain": ["读取输入", "计算相关性", "形成权重"],
+            "examples": ["同一词在不同句子中关注不同位置"],
+            "extensions": ["可以和动态卷积做有限类比"],
+            "boundaries": ["推理时模型参数不会重新训练"],
+            "connections": ["与内容寻址有关"],
+            "open_questions": ["不同注意力头如何分工"],
+            "next_step": "手算一个小例子。",
+            "sources": [
+                {
+                    "title": "Reference",
+                    "url": "https://example.com/reference",
+                    "summary": "An explanatory source.",
+                }
+            ],
+        }
+        markdown = render_knowledge_markdown(
+            {
+                "id": "knowledge-id",
+                "title": content["title"],
+                "created_at": "2026-08-10T00:00:00+00:00",
+                "updated_at": "2026-08-10T00:00:00+00:00",
+                "version": 1,
+                "content": content,
+            }
+        )
+        parsed = parse_markdown(markdown, "fallback")
+
+        self.assertIn("## 延伸理解", markdown)
+        self.assertEqual(parsed["content"]["extensions"], content["extensions"])
+        self.assertEqual(parsed["content"]["sources"], content["sources"])
 
     def test_scan_is_read_only_incremental_and_tracks_a_rename(self) -> None:
         note = self.vault_path / "Notes" / "Attention.md"
