@@ -23,6 +23,14 @@ class FailingDeepSeekClient:
         raise DeepSeekError("simulated outage")
 
 
+class EditingDeepSeekClient:
+    configured = True
+    settings = SimpleNamespace(model="deepseek-v4-flash")
+
+    def revise_knowledge(self, _conversation, current, instruction, _sources):
+        return {**current, "extensions": [instruction]}
+
+
 class ReflectionServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -105,6 +113,48 @@ class ReflectionServiceTests(unittest.TestCase):
         self.assertEqual(self.database.get_messages(session_id), [])
         self.assertIsNone(self.database.get_knowledge_draft(session_id))
         self.assertEqual(self.service.knowledge_list()["items"], [])
+
+    def test_user_can_edit_the_draft_before_confirming(self) -> None:
+        started = self.service.start(force_new=True)
+        session_id = started["session"]["id"]
+        self.service.reply(session_id, "An early thought.")
+        draft = self.service.finish(session_id)["knowledge_draft"]
+        edited = {
+            **draft,
+            "title": "A clearer title",
+            "core_insight": "A manually clarified explanation.",
+            "key_points": ["The user's edited key point."],
+        }
+
+        updated = self.service.update_draft(session_id, edited)
+        completed = self.service.confirm(session_id)
+
+        self.assertEqual(updated["knowledge_draft"]["title"], "A clearer title")
+        self.assertEqual(completed["knowledge"]["content"]["core_insight"], edited["core_insight"])
+
+    def test_ai_revision_uses_the_current_edited_draft(self) -> None:
+        service = ReflectionService(self.database, EditingDeepSeekClient())
+        started = service.start(force_new=True)
+        session_id = started["session"]["id"]
+        service._database.add_message(session_id, "user", "A knowledge seed.")
+        draft = {
+            "title": "Seed",
+            "core_insight": "A complete seed explanation.",
+            "key_points": ["One point"],
+            "logic_chain": [],
+            "examples": [],
+            "extensions": [],
+            "boundaries": [],
+            "connections": [],
+            "open_questions": [],
+            "next_step": "",
+            "sources": [],
+        }
+        self.database.save_knowledge_draft(session_id, draft)
+
+        revised = service.revise_draft(session_id, "加入迁移应用", draft)
+
+        self.assertEqual(revised["knowledge_draft"]["extensions"], ["加入迁移应用"])
 
     def test_discarding_an_extension_keeps_existing_knowledge_unchanged(self) -> None:
         first = self.service.start(force_new=True)

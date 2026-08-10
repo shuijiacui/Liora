@@ -47,3 +47,33 @@ class DeepSeekSettings:
             model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash",
             timeout_seconds=timeout,
         )
+
+
+@dataclass(frozen=True)
+class WebSearchSettings:
+    api_key: str
+    base_url: str
+    timeout_seconds: float
+    max_results: int
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key.strip())
+
+    @classmethod
+    def from_project(cls, project_root: Path) -> "WebSearchSettings":
+        load_dotenv(project_root / ".env")
+        try:
+            timeout = min(max(float(os.getenv("TAVILY_TIMEOUT_SECONDS", "15")), 5.0), 60.0)
+        except ValueError:
+            timeout = 15.0
+        try:
+            maximum = min(max(int(os.getenv("TAVILY_MAX_RESULTS", "4")), 1), 8)
+        except ValueError:
+            maximum = 4
+        return cls(
+            api_key=os.getenv("TAVILY_API_KEY", "").strip(),
+            base_url=os.getenv("TAVILY_BASE_URL", "https://api.tavily.com").rstrip("/"),
+            timeout_seconds=timeout,
+            max_results=maximum,
+        )

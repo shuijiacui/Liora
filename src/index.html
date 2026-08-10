@@ -79,14 +79,37 @@
           <article id="knowledge-card" class="knowledge-card" hidden>
             <h2 id="knowledge-title"></h2>
             <p id="knowledge-core" class="knowledge-card__core"></p>
-            <ol id="knowledge-chain" class="knowledge-chain"></ol>
-            <div id="knowledge-questions" class="knowledge-questions" hidden>
-              <h3>还想继续弄清</h3>
-              <ul id="knowledge-question-list"></ul>
-            </div>
+            <div id="knowledge-sections" class="knowledge-sections"></div>
             <p id="knowledge-next-step" class="knowledge-card__next"></p>
+            <div id="knowledge-sources" class="knowledge-sources" hidden>
+              <h3>参考资料</h3>
+              <ul id="knowledge-source-list"></ul>
+            </div>
             <p id="knowledge-meta" class="knowledge-card__meta"></p>
           </article>
+
+          <form id="draft-editor" class="draft-editor" hidden>
+            <label>标题<input id="draft-title" maxlength="80" required /></label>
+            <label>核心理解<textarea id="draft-core" rows="6" maxlength="3000" required></textarea></label>
+            <label>关键要点<textarea id="draft-key-points" rows="4" placeholder="每行一条"></textarea></label>
+            <label>原理与推理<textarea id="draft-logic-chain" rows="4" placeholder="每行一步"></textarea></label>
+            <label>例子与反例<textarea id="draft-examples" rows="3" placeholder="每行一条，可留空"></textarea></label>
+            <label>延伸理解<textarea id="draft-extensions" rows="3" placeholder="每行一条，可留空"></textarea></label>
+            <label>边界与误区<textarea id="draft-boundaries" rows="3" placeholder="每行一条，可留空"></textarea></label>
+            <label>知识联系<textarea id="draft-connections" rows="3" placeholder="每行一条，可留空"></textarea></label>
+            <label>尚待探索<textarea id="draft-open-questions" rows="3" placeholder="每行一条，可留空"></textarea></label>
+            <label>下一步<textarea id="draft-next-step" rows="2" maxlength="1200"></textarea></label>
+            <fieldset class="draft-feedback">
+              <legend>请 Liora 修改</legend>
+              <div class="draft-feedback__suggestions">
+                <button type="button" data-draft-suggestion="把核心原理解释得更深入、更清楚。">讲透原理</button>
+                <button type="button" data-draft-suggestion="增加一个具体、容易理解的例子。">补充例子</button>
+                <button type="button" data-draft-suggestion="检查事实和适用边界；需要时联网查证并附上来源。">核实事实</button>
+                <button type="button" data-draft-suggestion="精简重复内容，但保留关键推理和知识延伸。">精简表达</button>
+              </div>
+              <textarea id="draft-feedback-input" rows="3" maxlength="1200" placeholder="例如：展开第二点，保留我的类比，并联网确认这个结论……"></textarea>
+            </fieldset>
+          </form>
 
           <div id="reflection-error" class="interaction-error" role="alert" hidden></div>
         </div>
@@ -107,14 +130,20 @@
             <span class="microphone-dot" aria-hidden="true"></span>
             <span id="microphone-label">开始说</span>
           </button>
-          <button id="finish-button" class="bubble-action bubble-action--quiet" type="button">先记到这里</button>
+          <button id="finish-button" class="bubble-action bubble-action--quiet" type="button">生成知识文件</button>
         </footer>
 
         <footer id="confirmation-actions" class="bubble-actions bubble-actions--wrap" hidden>
           <button id="confirm-knowledge" class="bubble-action bubble-action--primary" type="button">这样保存</button>
-          <button id="continue-reflection" class="bubble-action" type="button">继续补充</button>
-          <button id="reorganize-knowledge" class="bubble-action bubble-action--quiet" type="button">重新整理</button>
+          <button id="edit-knowledge" class="bubble-action" type="button">编辑与修改</button>
+          <button id="continue-reflection" class="bubble-action bubble-action--quiet" type="button">继续聊聊</button>
           <button id="discard-knowledge" class="bubble-action bubble-action--quiet" type="button">这次不保存</button>
+        </footer>
+
+        <footer id="draft-editor-actions" class="bubble-actions bubble-actions--wrap" hidden>
+          <button id="save-draft" class="bubble-action bubble-action--primary" type="button">保存修改</button>
+          <button id="revise-draft" class="bubble-action" type="button">请 Liora 修改</button>
+          <button id="cancel-draft-edit" class="bubble-action bubble-action--quiet" type="button">返回预览</button>
         </footer>
 
         <footer id="discard-confirmation-actions" class="bubble-actions" hidden>

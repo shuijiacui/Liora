@@ -117,6 +117,22 @@ def _clean_lines(lines: list[str]) -> list[str]:
     return values
 
 
+def _parse_sources(lines: list[str]) -> list[dict]:
+    sources = []
+    for line in lines:
+        value = re.sub(r"^\s*(?:[-*+] |\d+[.)]\s+)", "", line).strip()
+        match = re.match(r"^\[([^]]+)]\((https?://[^)]+)\)(?:\s*[—-]\s*(.*))?$", value)
+        if match:
+            sources.append(
+                {
+                    "title": match.group(1).strip(),
+                    "url": match.group(2).strip(),
+                    "summary": (match.group(3) or "").strip(),
+                }
+            )
+    return sources
+
+
 def _knowledge_tags(metadata: dict, body: str) -> list[str]:
     raw = metadata.get("tags", metadata.get("tag", []))
     if isinstance(raw, str):
@@ -145,9 +161,15 @@ def parse_markdown(text: str, fallback_title: str) -> dict:
 
     aliases = {
         "core_insight": ("核心理解", "核心洞察", "core insight"),
-        "logic_chain": ("逻辑链", "logic chain"),
-        "open_questions": ("仍待确认", "还想继续弄清", "开放问题", "open questions"),
+        "key_points": ("关键要点", "关键概念", "key points"),
+        "logic_chain": ("原理与推理", "工作机制", "逻辑链", "logic chain"),
+        "examples": ("例子与反例", "示例", "examples"),
+        "extensions": ("延伸理解", "知识延伸", "extensions"),
+        "boundaries": ("边界与误区", "适用边界", "boundaries"),
+        "connections": ("知识联系", "对比与联系", "connections"),
+        "open_questions": ("尚待探索", "仍待确认", "还想继续弄清", "开放问题", "open questions"),
         "next_step": ("下一步", "next step"),
+        "sources": ("参考资料", "来源", "sources"),
     }
 
     def find_section(names: tuple[str, ...]) -> list[str]:
@@ -183,9 +205,15 @@ def parse_markdown(text: str, fallback_title: str) -> dict:
         "content": {
             "title": title,
             "core_insight": "\n".join(core_lines).strip(),
+            "key_points": _clean_lines(find_section(aliases["key_points"])),
             "logic_chain": _clean_lines(find_section(aliases["logic_chain"])),
+            "examples": _clean_lines(find_section(aliases["examples"])),
+            "extensions": _clean_lines(find_section(aliases["extensions"])),
+            "boundaries": _clean_lines(find_section(aliases["boundaries"])),
+            "connections": _clean_lines(find_section(aliases["connections"])),
             "open_questions": _clean_lines(find_section(aliases["open_questions"])),
             "next_step": "\n".join(_clean_lines(find_section(aliases["next_step"]))).strip(),
+            "sources": _parse_sources(find_section(aliases["sources"])),
         },
     }
 
@@ -196,23 +224,39 @@ def _knowledge_sections(content: dict, heading_level: int = 2) -> str:
         f"{prefix} 核心理解",
         "",
         str(content.get("core_insight") or "").strip(),
-        "",
-        f"{prefix} 逻辑链",
-        "",
     ]
-    chain = content.get("logic_chain") or []
-    lines.extend([f"- {item}" for item in chain] or ["- 暂无"])
-    lines.extend(["", f"{prefix} 仍待确认", ""])
-    questions = content.get("open_questions") or []
-    lines.extend([f"- {item}" for item in questions] or ["- 暂无"])
-    lines.extend(
-        [
-            "",
-            f"{prefix} 下一步",
-            "",
-            str(content.get("next_step") or "").strip(),
-        ]
-    )
+
+    def add_list(title: str, key: str) -> None:
+        values = content.get(key) or []
+        if values:
+            lines.extend(["", f"{prefix} {title}", ""])
+            lines.extend(f"- {item}" for item in values)
+
+    add_list("关键要点", "key_points")
+    add_list("原理与推理", "logic_chain")
+    add_list("例子与反例", "examples")
+    add_list("延伸理解", "extensions")
+    add_list("边界与误区", "boundaries")
+    add_list("知识联系", "connections")
+    add_list("尚待探索", "open_questions")
+    if str(content.get("next_step") or "").strip():
+        lines.extend(
+            [
+                "",
+                f"{prefix} 下一步",
+                "",
+                str(content.get("next_step") or "").strip(),
+            ]
+        )
+    sources = content.get("sources") or []
+    if sources:
+        lines.extend(["", f"{prefix} 参考资料", ""])
+        for source in sources:
+            title = str(source.get("title") or source.get("url") or "来源").replace("]", "\\]")
+            url = str(source.get("url") or "").strip()
+            summary = str(source.get("summary") or "").strip()
+            if url:
+                lines.append(f"- [{title}]({url})" + (f" — {summary}" if summary else ""))
     return "\n".join(lines).rstrip()
 
 
