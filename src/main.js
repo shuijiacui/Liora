@@ -36,6 +36,10 @@ const { createRuntimeProfile } = require('./platform/runtime-profile');
 const { createWindowAdapter } = require('./platform/window-adapter');
 const { cleanLocationName } = require('./shared/location-name');
 const { buildKnowledgePath } = require('./shared/knowledge-query');
+const {
+  publishConnection: publishKnowledgeEngineConnection,
+  removeConnection: removeKnowledgeEngineConnection
+} = require('./shared/knowledge-engine-connection');
 
 loadEnvFile(path.join(__dirname, '..', '.env'));
 if (process.env.LIORA_USER_DATA_DIR && path.isAbsolute(process.env.LIORA_USER_DATA_DIR)) {
@@ -325,6 +329,12 @@ function openReflection() {
   petWindow?.webContents.send('reflection:open');
 }
 
+function openReview() {
+  showPet();
+  setWindowMode('dialog');
+  petWindow?.webContents.send('review:open');
+}
+
 function togglePet() {
   if (!petWindow || petWindow.isDestroyed()) {
     return;
@@ -481,11 +491,11 @@ function handleRecognizedSpeech(event) {
 }
 
 function sendVoiceClarification({ transcript, route, reason }) {
-  let message = '我听到了，但还不能确定你想进入反思、知识还是天气。';
+  let message = '我听到了，但还不能确定你想进入反思、回顾、知识还是天气。';
   if (reason === 'low-confidence') {
     message = '这句话我没有听清。你可以再说一次“Hi Liora”，然后自然地告诉我想做什么。';
   } else if (route?.ambiguous) {
-    message = '这句话里有不止一个方向，我先不替你决定。你想反思、看知识，还是问天气？';
+    message = '这句话里有不止一个方向，我先不替你决定。你想反思、回顾、看知识，还是问天气？';
   } else if (reason === 'timeout') {
     message = '我在听，不过没有听到后续内容。需要时再叫我一声。';
   }
@@ -615,6 +625,7 @@ function trayMenu() {
   const weatherConfigured = Boolean(weatherService?.status().configured);
   return Menu.buildFromTemplate([
     { label: '开始今日反思', click: openReflection },
+    { label: '开始知识回顾', click: openReview },
     { type: 'separator' },
     {
       label: petWindow?.isVisible() ? '隐藏 Liora' : '显示 Liora',
@@ -718,7 +729,9 @@ async function maybeShowDailyReminder() {
   try {
     const history = await backendRequest('GET', '/api/reflections?limit=20');
     const completedToday = history.sessions.some(
-      (session) => session.completed_at && localDateKey(session.completed_at) === today
+      (session) => session.session_type !== 'review'
+        && session.completed_at
+        && localDateKey(session.completed_at) === today
     );
     if (completedToday) {
       markReminderHandledToday();
@@ -968,6 +981,18 @@ async function startBackend() {
           } catch (error) {
             console.warn(`Could not read Liora voice event: ${error.message}`);
           }
+          continue;
+        }
+        if (line.startsWith('LIORA_REFLECTION_EVENT ')) {
+          try {
+            const event = JSON.parse(line.slice('LIORA_REFLECTION_EVENT '.length));
+            if (event?.type === 'review-task-started') {
+              showPet();
+              petWindow?.webContents.send('review:open', event);
+            }
+          } catch (error) {
+            console.warn(`Could not read Liora reflection event: ${error.message}`);
+          }
         }
       }
     });
@@ -1163,6 +1188,21 @@ function registerIpc() {
     if (!isPetSender(event)) throw new Error('unauthorized');
     return backendRequest('POST', `/api/reflections/${encodeURIComponent(sessionId)}/confirm`, {});
   });
+  ipcMain.handle('review:start', (event) => {
+    if (!isPetSender(event)) throw new Error('unauthorized');
+    return backendRequest('POST', '/api/reviews/start', {});
+  });
+  ipcMain.handle('review:defer', (event, sessionId, days = 3) => {
+    if (!isPetSender(event)) throw new Error('unauthorized');
+    return backendRequest('POST', `/api/reflections/${encodeURIComponent(sessionId)}/defer`, { days });
+  });
+  ipcMain.handle('reflection:rate', (event, sessionId, rating, independentRecall = null) => {
+    if (!isPetSender(event)) throw new Error('unauthorized');
+    return backendRequest('POST', `/api/reflections/${encodeURIComponent(sessionId)}/rate`, {
+      rating,
+      independent_recall: typeof independentRecall === 'boolean' ? independentRecall : null
+    });
+  });
   ipcMain.handle('reflection:discard', (event, sessionId) => {
     if (!isPetSender(event)) throw new Error('unauthorized');
     return backendRequest('POST', `/api/reflections/${encodeURIComponent(sessionId)}/discard`, {});
@@ -1223,6 +1263,14 @@ app.whenReady().then(() => {
   configureSessionPermissions();
   backendReady = startBackend();
   backendReady.then(() => {
+    try {
+      publishKnowledgeEngineConnection(app.getPath('userData'), {
+        port: backendPort,
+        token: backendToken
+      });
+    } catch (error) {
+      console.warn(`Unable to publish Knowledge Engine connection: ${error.message}`);
+    }
     dictationReady = true;
     sendVoiceStatus();
   }).catch((error) => console.error('Unable to start Liora backend:', error.message));
@@ -1246,6 +1294,11 @@ app.on('before-quit', () => {
   clearTimeout(dictationTimer);
   weatherService?.stop();
   void voiceService?.stop();
+  try {
+    removeKnowledgeEngineConnection(app.getPath('userData'), backendToken);
+  } catch (error) {
+    console.warn(`Unable to remove Knowledge Engine connection: ${error.message}`);
+  }
   if (backendProcess) {
     backendProcess.kill();
     backendProcess = null;

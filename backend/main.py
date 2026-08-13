@@ -19,6 +19,10 @@ def format_voice_event(payload: dict) -> str:
     return f"LIORA_VOICE_EVENT {json.dumps(payload, ensure_ascii=True)}"
 
 
+def format_reflection_event(payload: dict) -> str:
+    return f"LIORA_REFLECTION_EVENT {json.dumps(payload, ensure_ascii=True)}"
+
+
 class ReflectionHandler(BaseHTTPRequestHandler):
     server_version = "LioraReflection/0.1"
 
@@ -33,6 +37,48 @@ class ReflectionHandler(BaseHTTPRequestHandler):
                 query = parse_qs(route.query)
                 limit = int(query.get("limit", ["20"])[0])
                 return self._json(200, self.server.service.history(limit))
+            if route.path == "/api/dashboard":
+                return self._json(200, self.server.service.dashboard())
+            if route.path == "/api/reflection-prompts":
+                query = parse_qs(route.query)
+                limit = int(query.get("limit", ["8"])[0])
+                return self._json(200, self.server.service.reflection_prompts(limit))
+            if route.path == "/api/changesets":
+                query = parse_qs(route.query)
+                return self._json(
+                    200,
+                    self.server.service.changesets(
+                        query.get("status", ["pending"])[0],
+                        int(query.get("limit", ["30"])[0]),
+                    ),
+                )
+            if route.path == "/api/semantic-search":
+                query = parse_qs(route.query)
+                return self._json(
+                    200,
+                    self.server.service.semantic_search(
+                        query.get("q", [""])[0],
+                        int(query.get("limit", ["10"])[0]),
+                    ),
+                )
+            if route.path == "/api/relations":
+                query = parse_qs(route.query)
+                return self._json(
+                    200,
+                    self.server.service.relations(
+                        query.get("status", [""])[0],
+                        int(query.get("limit", ["100"])[0]),
+                    ),
+                )
+            if route.path == "/api/granularity":
+                query = parse_qs(route.query)
+                return self._json(
+                    200,
+                    self.server.service.granularity(
+                        query.get("status", ["candidate"])[0],
+                        int(query.get("limit", ["40"])[0]),
+                    ),
+                )
             if route.path == "/api/knowledge":
                 query = parse_qs(route.query)
                 limit = int(query.get("limit", ["20"])[0])
@@ -77,6 +123,8 @@ class ReflectionHandler(BaseHTTPRequestHandler):
                         str(body.get("knowledge_id") or "") or None,
                     ),
                 )
+            if route == "/api/reviews/start":
+                return self._json(200, self.server.service.start_review())
             if route == "/api/voice/start":
                 return self._json(200, self.server.voice_transcriber.start())
             if route == "/api/voice/stop":
@@ -108,8 +156,55 @@ class ReflectionHandler(BaseHTTPRequestHandler):
                 return self._json(200, self.server.service.rebuild_vault_index())
             if route == "/api/storage/migrate":
                 return self._json(200, self.server.service.migrate_legacy_knowledge())
+            if route == "/api/knowledge/ask":
+                return self._json(
+                    200,
+                    self.server.service.knowledge_answer(str(body.get("question") or "")),
+                )
 
             parts = [part for part in route.split("/") if part]
+            if len(parts) == 4 and parts[:2] == ["api", "changesets"]:
+                changeset_id, action = parts[2], parts[3]
+                if action == "apply":
+                    return self._json(200, self.server.service.apply_changeset(changeset_id))
+                if action == "reject":
+                    return self._json(200, self.server.service.reject_changeset(changeset_id))
+                if action == "rollback":
+                    return self._json(200, self.server.service.rollback_changeset(changeset_id))
+            if len(parts) == 4 and parts[:2] == ["api", "relations"]:
+                relation_id, action = parts[2], parts[3]
+                if action in {"confirm", "reject"}:
+                    return self._json(
+                        200,
+                        self.server.service.update_relation(
+                            relation_id, "confirmed" if action == "confirm" else "rejected"
+                        ),
+                    )
+            if len(parts) == 4 and parts[:2] == ["api", "granularity"]:
+                candidate_id, action = parts[2], parts[3]
+                if action == "apply":
+                    return self._json(200, self.server.service.apply_granularity(candidate_id))
+                if action == "reject":
+                    return self._json(200, self.server.service.reject_granularity(candidate_id))
+            if len(parts) == 4 and parts[:2] == ["api", "reflection-prompts"]:
+                prompt_id, action = parts[2], parts[3]
+                if action == "start":
+                    payload = self.server.service.start_prompt(prompt_id)
+                    callback = getattr(self.server, "reflection_event_callback", None)
+                    if callback:
+                        callback({
+                            "type": "review-task-started",
+                            "session_id": payload["session"]["id"],
+                            "prompt_id": prompt_id,
+                        })
+                    return self._json(200, payload)
+                if action == "skip":
+                    return self._json(200, self.server.service.skip_prompt(prompt_id))
+                if action == "snooze":
+                    return self._json(
+                        200,
+                        self.server.service.snooze_prompt(prompt_id, int(body.get("days") or 3)),
+                    )
             if len(parts) == 4 and parts[:2] == ["api", "reflections"]:
                 session_id, action = parts[2], parts[3]
                 if action == "messages":
@@ -134,6 +229,25 @@ class ReflectionHandler(BaseHTTPRequestHandler):
                     return self._json(200, self.server.service.confirm(session_id))
                 if action == "discard":
                     return self._json(200, self.server.service.discard(session_id))
+                if action == "defer":
+                    return self._json(
+                        200,
+                        self.server.service.defer_review(session_id, int(body.get("days") or 3)),
+                    )
+                if action == "rate":
+                    independent = body.get("independent_recall")
+                    return self._json(
+                        200,
+                        self.server.service.rate_reflection(
+                            session_id,
+                            str(body.get("rating") or ""),
+                            independent if isinstance(independent, bool) else None,
+                            body.get("hint_count") if isinstance(body.get("hint_count"), int) else None,
+                            body.get("misconception_count")
+                            if isinstance(body.get("misconception_count"), int)
+                            else None,
+                        ),
+                    )
 
             return self._json(404, {"error": "not_found"})
         except (ValueError, LookupError) as error:
@@ -190,6 +304,7 @@ def main() -> None:
         search_client=WebSearchClient(search_settings),
         vault_path=Path(args.vault_path) if args.vault_path else None,
         data_dir=Path(args.data_dir),
+        models_dir=Path(args.models_dir) if args.models_dir else project_root / ".models",
     )
     def emit_voice_event(payload: dict) -> None:
         # Keep the process pipe ASCII-only. Electron decodes the JSON escapes,
@@ -202,6 +317,9 @@ def main() -> None:
     server.service = service
     server.voice_transcriber = voice_transcriber
     server.api_token = args.token
+    server.reflection_event_callback = lambda payload: print(
+        format_reflection_event(payload), flush=True
+    )
 
     def stop_server(*_) -> None:
         threading.Thread(target=server.shutdown, daemon=True).start()

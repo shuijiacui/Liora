@@ -6,6 +6,10 @@ const SIGNALS = {
     ['想法', 2], ['心情', 2], ['今天发生', 2], ['最近发生', 2],
     ['reflection', 4], ['reflect', 4], ['recap', 4], ['talk', 2], ['thought', 2]
   ],
+  review: [
+    ['回顾一下', 4], ['知识回顾', 5], ['复述', 5], ['抽查', 4], ['考考我', 5], ['主动回忆', 5],
+    ['review', 4], ['recall', 5], ['quiz me', 5]
+  ],
   knowledge: [
     ['知识库', 4], ['知识', 4], ['笔记', 4], ['记了什么', 4], ['记录过', 3],
     ['保存过', 3], ['之前记', 3], ['以前记', 3], ['回顾记录', 3],
@@ -23,6 +27,11 @@ const PHRASE_BONUSES = {
     /想.*(?:聊|说|谈)/u,
     /(?:陪我|帮我).*(?:反思|复盘|整理)/u,
     /(?:聊|说|谈).*(?:今天|最近|事情|想法)/u
+  ],
+  review: [
+    /(?:开始|进入|做|来).*(?:回顾|复述|主动回忆)/u,
+    /(?:回顾|复述|主动回忆).*(?:一下|知识|内容|以前|之前)?/u,
+    /(?:考考|抽查).*(?:我|知识)?/u
   ],
   knowledge: [
     /(?:查看|看看|打开|回顾|找).*(?:知识|笔记|记录|内容)/u,
@@ -49,7 +58,7 @@ function routeVoiceIntent(text) {
   const commandText = removeWakeWord(text);
   const normalized = normalizeTranscript(commandText);
   const scores = Object.fromEntries(
-    ['reflection', 'knowledge', 'weather'].map((intent) => [intent, scoreIntent(normalized, intent)])
+    ['reflection', 'review', 'knowledge', 'weather'].map((intent) => [intent, scoreIntent(normalized, intent)])
   );
   const ranked = Object.entries(scores).sort((left, right) => right[1] - left[1]);
   const [bestIntent, bestScore] = ranked[0];

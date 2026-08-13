@@ -19,6 +19,7 @@ release/
 build/
 .package-build/
 .package-venv/
+.build-check/
 tmp/
 *.log
 npm-debug.log*

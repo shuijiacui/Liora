@@ -1,6 +1,6 @@
 {
   "name": "liora-desktop-companion",
-  "version": "0.2.2",
+  "version": "0.2.4",
   "description": "A privacy-first desktop AI companion that turns daily reflections into a growing personal knowledge base.",
   "main": "src/main.js",
   "scripts": {

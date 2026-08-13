@@ -55,6 +55,31 @@ REVISION_PROMPT = """你是 Liora 的知识编辑。请根据用户的修改意�
 - 可以补充可靠的通用知识；涉及联网资料时不得编造来源。
 - 只返回与知识构建器相同结构的严格 JSON。"""
 
+ALIGNMENT_PROMPT = """你是 Liora 的知识对齐裁判。你的任务不是写知识，而是在本地检索已经找出的少量候选中判断新知识应如何归位。
+
+只允许选择：
+- CREATE：主题具有独立价值，应新建知识；
+- UPDATE：新内容与某候选是同一个知识主题，应更新该候选；
+- RELATED：主题独立但存在明确关系，应新建并记录关系；
+- CHILD：新内容是某候选中可独立检索和复习的子主题。
+
+规则：
+- 不得仅因共享术语就判定 UPDATE；必须是同一核心问题、机制或命题。
+- UPDATE、RELATED 或 CHILD 的 target_id 必须来自候选列表；CREATE 的 target_id 必须为 null。
+- 不得编造候选、事实或关系。
+- confidence 是这次分类判断的自评，不是统计概率。
+- 只返回严格 JSON，不要 Markdown：
+{
+  "decision": "CREATE | UPDATE | RELATED | CHILD",
+  "target_id": null,
+  "relationship": "",
+  "conflicts": [],
+  "reason": "简洁、可审核的判断依据",
+  "confidence": 0.0,
+  "needs_human_review": true
+}
+"""
+
 
 class DeepSeekError(RuntimeError):
     pass
@@ -160,6 +185,64 @@ class DeepSeekClient:
             [*current.get("sources", []), *(sources or [])]
         )
         return normalized
+
+    def judge_alignment(self, draft: dict, candidates: list[dict]) -> dict:
+        if not self.configured:
+            raise DeepSeekError("DeepSeek API Key 尚未配置。")
+        compact_candidates = [
+            {
+                "id": str(item.get("knowledge_id") or ""),
+                "title": str(item.get("title") or "")[:120],
+                "score": float(item.get("score") or 0),
+                "core_insight": str(
+                    item.get("core_insight") or item.get("snippet") or ""
+                )[:1200],
+                "key_points": [
+                    str(value)[:400] for value in (item.get("key_points") or [])[:5]
+                ],
+            }
+            for item in candidates[:3]
+            if item.get("knowledge_id")
+        ]
+        messages = [
+            {"role": "system", "content": ALIGNMENT_PROMPT},
+            {
+                "role": "user",
+                "content": "待对齐的新知识：\n" + json.dumps(draft, ensure_ascii=False),
+            },
+            {
+                "role": "user",
+                "content": "本地检索候选：\n"
+                + json.dumps(compact_candidates, ensure_ascii=False),
+            },
+        ]
+        raw = self._request(messages, temperature=0.0, max_tokens=700)
+        value = self._parse_json(raw)
+        decision = str(value.get("decision") or "").strip().upper()
+        if decision not in {"CREATE", "UPDATE", "RELATED", "CHILD"}:
+            raise DeepSeekError("DeepSeek 返回了无效的知识对齐结论。")
+        candidate_ids = {item["id"] for item in compact_candidates}
+        target_id = str(value.get("target_id") or "").strip() or None
+        if decision in {"UPDATE", "RELATED", "CHILD"} and target_id not in candidate_ids:
+            raise DeepSeekError("DeepSeek 选择了候选列表之外的知识。")
+        if decision == "CREATE":
+            target_id = None
+        try:
+            confidence = min(max(float(value.get("confidence") or 0), 0.0), 1.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        conflicts = value.get("conflicts")
+        return {
+            "decision": decision,
+            "target_id": target_id,
+            "relationship": str(value.get("relationship") or "").strip()[:500],
+            "conflicts": [str(item).strip()[:500] for item in conflicts[:8]]
+            if isinstance(conflicts, list)
+            else [],
+            "reason": str(value.get("reason") or "").strip()[:1200],
+            "confidence": round(confidence, 4),
+            "needs_human_review": bool(value.get("needs_human_review", True)),
+        }
 
     @staticmethod
     def _parse_json(raw: str) -> dict:

@@ -1,10 +1,25 @@
+import threading
 import uuid
+import hashlib
+import json
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from database import ReflectionDatabase, utc_now
 from deepseek_client import DeepSeekClient, DeepSeekError
+from knowledge_intelligence import (
+    align_knowledge,
+    content_diff,
+    content_fingerprint,
+    discover_relations,
+    granularity_candidates,
+    knowledge_text,
+    semantic_candidates,
+)
 from knowledge_store import KnowledgeVault
 from reflection_agent import START_PROMPT, follow_up, make_knowledge_draft
+from semantic_embedding import SemanticEmbeddingEngine
 from web_search import WebSearchClient, WebSearchError
 
 
@@ -24,24 +39,46 @@ class ReflectionService:
         search_client: WebSearchClient | None = None,
         vault_path: Path | None = None,
         data_dir: Path | None = None,
+        models_dir: Path | None = None,
+        embedding_engine: SemanticEmbeddingEngine | None = None,
     ):
         self._database = database
         self._llm_client = llm_client
         self._search_client = search_client
         self._data_dir = Path(data_dir) if data_dir else Path.cwd()
+        self._review_lock = threading.RLock()
+        self._embedding = embedding_engine or SemanticEmbeddingEngine(models_dir)
         self._vault: KnowledgeVault | None = None
         if vault_path:
             self.configure_vault(vault_path)
 
     def status(self) -> dict:
         configured = bool(self._llm_client and self._llm_client.configured)
+        judge_limit = self._alignment_daily_limit()
+        today = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat(timespec="seconds")
         return {
             "provider": "deepseek" if configured else "local",
             "model": self._llm_client.settings.model if configured else "local-reflection-agent",
             "configured": configured,
             "web_search": bool(self._search_client and self._search_client.configured),
             "storage": self.storage_status(),
+            "embedding": self._embedding.status(),
+            "alignment_judge": {
+                "mode": str(os.getenv("LIORA_ALIGNMENT_JUDGE", "balanced")).strip().lower(),
+                "daily_limit": judge_limit,
+                "calls_today": self._database.count_alignment_judgments_since(today),
+            },
         }
+
+    @staticmethod
+    def _alignment_daily_limit() -> int:
+        try:
+            value = int(os.getenv("LIORA_ALIGNMENT_DAILY_LIMIT", "20"))
+        except ValueError:
+            value = 20
+        return min(max(value, 0), 100)
 
     def configure_vault(self, vault_path: Path | str) -> dict:
         vault = KnowledgeVault(
@@ -51,6 +88,7 @@ class ReflectionService:
         )
         scan = vault.scan()
         self._vault = vault
+        self.refresh_intelligence(scan_vault=False)
         return {**vault.status(), "scan": scan}
 
     def storage_status(self) -> dict:
@@ -74,12 +112,205 @@ class ReflectionService:
         report = self._vault.migrate_legacy()
         return {"storage": self._vault.status(), "migration": report}
 
+    def dashboard(self) -> dict:
+        if self._vault:
+            scan = self._vault.scan(allow_cached=True)
+            return {
+                **self._database.knowledge_dashboard(),
+                "storage": self._vault.status(),
+                "scan": scan,
+            }
+
+        items = self._database.list_all_knowledge()
+        recent = [
+            {
+                "id": item["id"],
+                "title": item["title"],
+                "path": item.get("relative_path", ""),
+                "updated_at": item["updated_at"],
+                "summary": str(item.get("content", {}).get("core_insight") or "")[:240],
+                "object_type": "knowledge",
+            }
+            for item in items[:5]
+        ]
+        questions = []
+        for item in items:
+            for question in item.get("content", {}).get("open_questions", []):
+                value = str(question).strip()
+                if value:
+                    questions.append(
+                        {
+                            "knowledge_id": item["id"],
+                            "title": item["title"],
+                            "path": "",
+                            "question": value,
+                        }
+                    )
+                if len(questions) >= 5:
+                    break
+            if len(questions) >= 5:
+                break
+        return {
+            "knowledge_count": len(items),
+            "open_question_count": sum(
+                len(item.get("content", {}).get("open_questions", [])) for item in items
+            ),
+            "recent": recent,
+            "open_questions": questions,
+            "health": self._database.knowledge_health([item["id"] for item in items]),
+            "storage": self.storage_status(),
+        }
+
+    def reflection_prompts(self, limit: int = 8) -> dict:
+        safe_limit = min(max(int(limit), 1), 20)
+        if self._vault:
+            self._vault.scan(allow_cached=True)
+            items = self._database.knowledge_prompt_candidates(safe_limit)
+            return {"items": items, "total": len(items), "source": "open_questions"}
+
+        candidates = []
+        for item in self._database.list_all_knowledge():
+            context = str(item.get("content", {}).get("core_insight") or "").strip()[:240]
+            for question in item.get("content", {}).get("open_questions", []):
+                prompt = str(question).strip()
+                if not prompt:
+                    continue
+                candidates.append(
+                    {
+                        "id": str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"liora:knowledge-gap:{item['id']}:{prompt}",
+                            )
+                        ),
+                        "kind": "knowledge_gap",
+                        "knowledge_id": item["id"],
+                        "title": item["title"],
+                        "path": "",
+                        "context": context,
+                        "prompt": prompt,
+                        "reason_code": "open_question",
+                        "reason": (
+                            f"这个问题来自《{item['title']}》的“尚待探索”。"
+                            "Liora没有额外猜测你的掌握程度。"
+                        ),
+                    }
+                )
+        candidates = self._database.schedule_prompt_candidates(candidates, safe_limit)
+        return {"items": candidates, "total": len(candidates), "source": "open_questions"}
+
     def _get_knowledge(self, knowledge_id: str) -> dict | None:
         if self._vault:
             return self._database.get_knowledge_document(knowledge_id)
         return self._database.get_knowledge(knowledge_id)
 
-    def start(self, force_new: bool = False, knowledge_id: str | None = None) -> dict:
+    def _find_prompt(self, prompt_id: str) -> dict:
+        prompt_id = str(prompt_id or "").strip()
+        if not prompt_id:
+            raise ValueError("没有收到要复述的问题。")
+        for prompt in self.reflection_prompts(20)["items"]:
+            if prompt["id"] == prompt_id:
+                return prompt
+        raise LookupError("这个问题已经不在当前复述队列里了，请让 Liora 再翻翻。")
+
+    def start_prompt(self, prompt_id: str) -> dict:
+        with self._review_lock:
+            prompt_id = str(prompt_id or "").strip()
+            active = self._database.get_active_session("review")
+            if active:
+                if active.get("prompt_id") == prompt_id:
+                    return self._payload(active["id"], resumed=True)
+                has_user_content = any(
+                    message["role"] == "user"
+                    for message in self._database.get_messages(active["id"])
+                )
+                has_draft = self._database.get_knowledge_draft(active["id"]) is not None
+                if has_user_content or has_draft:
+                    raise ValueError(
+                        "Liora正在听上一段回顾。请先在桌宠的“回顾”里完成，"
+                        "或点“先放一放”。"
+                    )
+                # An assistant-only review contains no user contribution and can
+                # safely yield to the newly selected Obsidian question.
+                self._database.discard_session(active["id"])
+            prompt = self._find_prompt(prompt_id)
+            payload = self.start(
+                force_new=True,
+                knowledge_id=prompt["knowledge_id"],
+                prompt=prompt,
+                session_type="review",
+            )
+            self._database.mark_prompt_started(prompt["id"], prompt["knowledge_id"])
+            payload["started_from_obsidian"] = True
+            payload["prompt"] = prompt
+            return payload
+
+    def start_review(self) -> dict:
+        with self._review_lock:
+            active = self._database.get_active_session("review")
+            if active:
+                payload = self._payload(active["id"], resumed=True)
+                draft = self._database.get_knowledge_draft(active["id"])
+                if draft:
+                    payload["awaiting_confirmation"] = True
+                    payload["knowledge_draft"] = draft["content"]
+                return payload
+            prompts = self.reflection_prompts(1)["items"]
+            if not prompts:
+                return {
+                    "available": False,
+                    "reason": "no_due_prompt",
+                    "message": "Liora暂时没有找到该回顾的小问题。",
+                }
+            return self.start_prompt(prompts[0]["id"])
+
+    def defer_review(self, session_id: str, days: int = 3) -> dict:
+        with self._review_lock:
+            session = self._require_active_session(session_id)
+            if session.get("session_type") != "review" or not session.get("prompt_id"):
+                raise ValueError("只有知识回顾可以先放一放。")
+            discarded = self._database.discard_session(session_id)
+            snoozed = self._database.snooze_prompt(
+                discarded["prompt_id"], discarded["knowledge_id"], days
+            )
+            return {"deferred": True, "session_id": session_id, **snoozed}
+
+    def skip_prompt(self, prompt_id: str) -> dict:
+        prompt = self._find_prompt(prompt_id)
+        return {"skipped": True, **self._database.mark_prompt_skipped(
+            prompt["id"], prompt["knowledge_id"]
+        )}
+
+    def snooze_prompt(self, prompt_id: str, days: int = 3) -> dict:
+        prompt = self._find_prompt(prompt_id)
+        return {"snoozed": True, **self._database.snooze_prompt(
+            prompt["id"], prompt["knowledge_id"], days
+        )}
+
+    def rate_reflection(
+        self,
+        session_id: str,
+        rating: str,
+        independent_recall: bool | None = None,
+        hint_count: int | None = None,
+        misconception_count: int | None = None,
+    ) -> dict:
+        event = self._database.record_learning_event(
+            session_id,
+            rating,
+            independent_recall,
+            hint_count,
+            misconception_count,
+        )
+        return {"recorded": True, "event": event, "knowledge_state": event["knowledge_state"]}
+
+    def start(
+        self,
+        force_new: bool = False,
+        knowledge_id: str | None = None,
+        prompt: dict | None = None,
+        session_type: str = "reflection",
+    ) -> dict:
         existing_knowledge = None
         if knowledge_id:
             if self._vault:
@@ -87,17 +318,27 @@ class ReflectionService:
             existing_knowledge = self._get_knowledge(knowledge_id)
             if existing_knowledge is None:
                 raise LookupError("没有找到要继续完善的知识记录。")
-        session = None if force_new or knowledge_id else self._database.get_active_session()
+        session = (
+            None
+            if force_new or knowledge_id
+            else self._database.get_active_session(session_type)
+        )
         resumed = session is not None
 
         if session is None:
-            session = self._database.create_session(knowledge_id=knowledge_id)
-            prompt = (
-                f"关于“{existing_knowledge['title']}”，你又有了什么新的感悟？"
+            session = self._database.create_session(
+                knowledge_id=knowledge_id,
+                prompt=prompt,
+                session_type=session_type,
+            )
+            opening_prompt = (
+                str(prompt.get("prompt"))
+                if prompt
+                else f"关于“{existing_knowledge['title']}”，你又有了什么新的感悟？"
                 if existing_knowledge
                 else START_PROMPT
             )
-            self._database.add_message(session["id"], "assistant", prompt)
+            self._database.add_message(session["id"], "assistant", opening_prompt)
 
         payload = self._payload(session["id"], resumed=resumed)
         draft = self._database.get_knowledge_draft(session["id"])
@@ -247,29 +488,536 @@ class ReflectionService:
             draft = self._database.get_knowledge_draft(session_id)
             if draft is None:
                 raise LookupError("没有找到待确认的知识整理结果。")
-            existing = self._get_knowledge(draft.get("knowledge_id") or session.get("knowledge_id"))
+            self._vault.scan()
+            documents = self._database.list_knowledge_documents(1000)
+            explicit_target = draft.get("knowledge_id") or session.get("knowledge_id")
+            if self._embedding.available:
+                self.refresh_intelligence(scan_vault=False)
+                stored_embeddings = self._database.list_embeddings()
+                documents = [
+                    {
+                        **item,
+                        "embedding": (stored_embeddings.get(item["id"]) or {}).get("vector", []),
+                    }
+                    for item in documents
+                ]
+            semantic_model = self._embedding.using_semantic_model
+            alignment = align_knowledge(
+                draft["content"],
+                documents,
+                explicit_target,
+                document_embedder=self._embedding.embed_document,
+                semantic_model=semantic_model,
+            )
+            alignment = self._judge_ambiguous_alignment(
+                draft["content"], alignment, documents, explicit_target
+            )
+            existing = self._get_knowledge(alignment.get("target_id"))
+            content = self._merge_knowledge_content(existing, draft["content"])
             knowledge_id = existing["id"] if existing else str(uuid.uuid4())
-            version = int(existing.get("version") or 0) + 1 if existing else 1
-            now = utc_now()
-            proposed = {
-                "id": knowledge_id,
-                "title": draft["content"]["title"],
-                "created_at": existing["created_at"] if existing else now,
-                "updated_at": now,
-                "version": version,
-                "content": draft["content"],
-            }
-            knowledge = self._vault.write(proposed)
-            self._database.confirm_knowledge_draft(
+            target_path = existing.get("relative_path") if existing else None
+            before_markdown = self._vault.read_markdown(target_path) if target_path else None
+            top_score = (
+                alignment["candidates"][0]["score"] if alignment.get("candidates") else 0
+            )
+            thresholds = alignment.get("thresholds") or {}
+            related_threshold = float(thresholds.get("related") or 0.42)
+            ambiguous = (
+                not explicit_target
+                and (
+                    (alignment["action"] == "create" and top_score >= related_threshold)
+                    or (
+                        alignment["action"] == "update"
+                        and alignment.get("decision_basis") == "semantic"
+                    )
+                )
+            )
+            risk = "review" if ambiguous or alignment.get("adjudication") else "low"
+            changeset = self._database.create_changeset(
+                {
+                    "session_id": session_id,
+                    "action": alignment["action"],
+                    "target_id": knowledge_id,
+                    "target_path": target_path,
+                    "status": "pending",
+                    "risk": risk,
+                    "title": content["title"],
+                    "reason": alignment["reason"],
+                    "alignment": alignment,
+                    "before": existing.get("content") if existing else None,
+                    "after": content,
+                    "diff": content_diff(existing.get("content") if existing else None, content),
+                    "before_markdown": before_markdown,
+                }
+            )
+            if risk == "low":
+                changeset = self.apply_changeset(changeset["id"], complete_session=False)
+                knowledge = changeset["result"]["knowledge"]
+            else:
+                knowledge = {
+                    "id": knowledge_id,
+                    "title": content["title"],
+                    "content": content,
+                    "pending": True,
+                }
+            self._database.complete_session_after_changeset(
                 session_id,
-                knowledge_id_override=knowledge_id,
-                version_override=version,
+                knowledge_id,
+                content["core_insight"],
             )
         else:
             knowledge = self._database.confirm_knowledge_draft(session_id)
         payload = self._payload(session_id, complete=True)
         payload["knowledge"] = knowledge
+        if self._vault:
+            payload["changeset"] = changeset
+            payload["review_required"] = changeset["status"] == "pending"
         return payload
+
+    @staticmethod
+    def _merge_knowledge_content(existing: dict | None, draft: dict) -> dict:
+        if not existing:
+            return draft
+        before = existing.get("content") or {}
+        merged = {**before, **draft}
+        for key in (
+            "key_points", "logic_chain", "examples", "extensions", "boundaries",
+            "connections", "open_questions", "sources",
+        ):
+            values = []
+            seen = set()
+            for item in [*(before.get(key) or []), *(draft.get(key) or [])]:
+                identity = str(item).casefold().strip()
+                if identity and identity not in seen:
+                    seen.add(identity)
+                    values.append(item)
+            merged[key] = values[:8]
+        return merged
+
+    def _judge_ambiguous_alignment(
+        self,
+        draft: dict,
+        alignment: dict,
+        documents: list[dict],
+        explicit_target: str | None,
+    ) -> dict:
+        mode = str(os.getenv("LIORA_ALIGNMENT_JUDGE", "balanced")).strip().lower()
+        if mode in {"off", "local", "disabled", "0", "false"}:
+            return alignment
+        if explicit_target or alignment.get("decision_basis") == "exact_title":
+            return alignment
+        candidates = alignment.get("candidates") or []
+        if not candidates or not self._llm_client or not self._llm_client.configured:
+            return alignment
+        thresholds = alignment.get("thresholds") or {}
+        related_threshold = float(thresholds.get("related") or 0.42)
+        top_score = float(candidates[0].get("score") or 0)
+        second_score = float(candidates[1].get("score") or 0) if len(candidates) > 1 else 0
+        ambiguous = (
+            top_score >= related_threshold
+            or (top_score >= max(related_threshold - 0.05, 0) and top_score - second_score < 0.04)
+        )
+        if not ambiguous:
+            return alignment
+
+        by_id = {item["id"]: item for item in documents}
+        enriched = []
+        for candidate in candidates[:3]:
+            item = by_id.get(candidate.get("knowledge_id")) or {}
+            content = item.get("content") or {}
+            enriched.append(
+                {
+                    **candidate,
+                    "core_insight": content.get("core_insight") or candidate.get("snippet") or "",
+                    "key_points": content.get("key_points") or [],
+                }
+            )
+        signature_data = {
+            "draft": content_fingerprint(draft),
+            "candidates": [
+                [item.get("knowledge_id"), item.get("score"), by_id.get(item.get("knowledge_id"), {}).get("version")]
+                for item in enriched
+            ],
+            "model": self._llm_client.settings.model,
+            "schema": 1,
+        }
+        signature = hashlib.sha256(
+            json.dumps(signature_data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cached = self._database.get_alignment_judgment(signature)
+        if not cached:
+            today = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat(timespec="seconds")
+            limit = self._alignment_daily_limit()
+            used = self._database.count_alignment_judgments_since(today)
+            if limit == 0 or used >= limit:
+                return {
+                    **alignment,
+                    "adjudication_error": "DeepSeek 知识对齐今日调用上限已到，已保留本地建议并等待人工审核。",
+                    "adjudication_provider": "daily-limit-local-kept",
+                }
+        try:
+            judgment = cached or self._llm_client.judge_alignment(draft, enriched)
+            if not cached:
+                self._database.save_alignment_judgment(
+                    signature, self._llm_client.settings.model, judgment
+                )
+        except DeepSeekError as error:
+            return {
+                **alignment,
+                "adjudication_error": str(error),
+                "adjudication_provider": "deepseek-failed-local-kept",
+            }
+
+        decision = judgment["decision"]
+        target_id = judgment.get("target_id")
+        resolved = {**alignment}
+        resolved["local_decision"] = {
+            "action": alignment.get("action"),
+            "decision_basis": alignment.get("decision_basis"),
+            "target_id": alignment.get("target_id"),
+            "reason": alignment.get("reason"),
+        }
+        resolved["adjudication"] = {
+            **judgment,
+            "provider": "deepseek-cache" if cached else "deepseek",
+            "signature": signature,
+        }
+        resolved["reason"] = judgment.get("reason") or alignment.get("reason")
+        resolved["confidence"] = judgment.get("confidence", alignment.get("confidence"))
+        resolved["decision_basis"] = "deepseek_adjudication"
+        if decision == "UPDATE":
+            target = by_id.get(target_id)
+            if target:
+                resolved["action"] = "update"
+                resolved["target_id"] = target_id
+                resolved["target_title"] = target.get("title")
+        else:
+            resolved["action"] = "create"
+            resolved["target_id"] = None
+            resolved["target_title"] = None
+            if decision == "CHILD":
+                resolved["parent_id"] = target_id
+            if decision == "RELATED":
+                resolved["related_target_id"] = target_id
+        return resolved
+
+    def changesets(self, status: str = "pending", limit: int = 30) -> dict:
+        items = self._database.list_changesets(status, limit)
+        return {"items": items, "total": len(items)}
+
+    def apply_changeset(self, changeset_id: str, complete_session: bool = True) -> dict:
+        if not self._vault:
+            raise ValueError("请先连接 Obsidian Vault。")
+        changeset = self._database.get_changeset(changeset_id)
+        if not changeset:
+            raise LookupError("没有找到这条知识变更。")
+        if changeset["status"] == "applied":
+            return changeset
+        if changeset["status"] != "pending":
+            raise ValueError("这条知识变更已经处理过了。")
+        existing = self._get_knowledge(changeset.get("target_id"))
+        now = utc_now()
+        proposed = {
+            "id": changeset["target_id"] or str(uuid.uuid4()),
+            "title": changeset["after"]["title"],
+            "created_at": existing["created_at"] if existing else now,
+            "updated_at": now,
+            "version": int(existing.get("version") or 0) + 1 if existing else 1,
+            "content": changeset["after"],
+        }
+        knowledge = self._vault.write(proposed)
+        alignment = changeset.get("alignment") or {}
+        adjudication = alignment.get("adjudication") or {}
+        if alignment.get("parent_id"):
+            self._database.add_hierarchy(
+                alignment["parent_id"], knowledge["id"], "deepseek_alignment"
+            )
+        if alignment.get("related_target_id"):
+            self._database.replace_discovered_relations(
+                [
+                    {
+                        "source_id": knowledge["id"],
+                        "target_id": alignment["related_target_id"],
+                        "kind": "soft",
+                        "label": "deepseek_related",
+                        "confidence": float(adjudication.get("confidence") or 0.5),
+                        "reason": adjudication.get("reason")
+                        or "Liora 在知识对齐审核中确认了这两条知识的关系。",
+                        "status": "confirmed",
+                    }
+                ]
+            )
+        resolved = self._database.resolve_changeset(
+            changeset_id, "applied", {"knowledge": knowledge}
+        )
+        if complete_session and changeset.get("session_id"):
+            session = self._database.get_session(changeset["session_id"])
+            if session and session["status"] == "active":
+                self._database.complete_session_after_changeset(
+                    session["id"], knowledge["id"], changeset["after"].get("core_insight", "")
+                )
+        self.refresh_intelligence(scan_vault=False)
+        return resolved
+
+    def reject_changeset(self, changeset_id: str) -> dict:
+        changeset = self._database.get_changeset(changeset_id)
+        if not changeset:
+            raise LookupError("没有找到这条知识变更。")
+        if changeset["status"] != "pending":
+            raise ValueError("这条知识变更已经处理过了。")
+        return self._database.resolve_changeset(changeset_id, "rejected")
+
+    def rollback_changeset(self, changeset_id: str) -> dict:
+        if not self._vault:
+            raise ValueError("请先连接 Obsidian Vault。")
+        changeset = self._database.get_changeset(changeset_id)
+        if not changeset:
+            raise LookupError("没有找到这条知识变更。")
+        if changeset["status"] != "applied":
+            raise ValueError("只有已经应用的变更可以回滚。")
+        result = changeset.get("result") or {}
+        knowledge = result.get("knowledge") or {}
+        relative_path = knowledge.get("relative_path") or changeset.get("target_path")
+        if not relative_path:
+            raise ValueError("这条变更缺少可回滚的文件路径。")
+        if changeset.get("before_markdown") is not None:
+            self._vault.restore_markdown(relative_path, changeset["before_markdown"])
+        else:
+            self._vault.delete_created(relative_path)
+            if knowledge.get("id") or changeset.get("target_id"):
+                self._database.remove_knowledge_intelligence(
+                    knowledge.get("id") or changeset["target_id"]
+                )
+        resolved = self._database.resolve_changeset(changeset_id, "rolled_back")
+        self.refresh_intelligence(scan_vault=False)
+        return resolved
+
+    def refresh_intelligence(self, scan_vault: bool = True) -> dict:
+        if self._vault and scan_vault:
+            self._vault.scan(allow_cached=True)
+        documents = (
+            self._database.list_knowledge_documents(1000)
+            if self._vault
+            else self._database.list_all_knowledge()
+        )
+        self._embedding.prepare()
+        cached = self._database.list_embeddings()
+        enriched = []
+        embedding_model = self._embedding.model_name
+        changed = []
+        for item in documents:
+            fingerprint = content_fingerprint(item.get("content") or {}, item.get("title") or "")
+            stored = cached.get(item["id"])
+            if (
+                stored
+                and stored["fingerprint"] == fingerprint
+                and stored.get("model") == embedding_model
+            ):
+                enriched.append({**item, "embedding": stored["vector"]})
+            else:
+                changed.append((item, fingerprint))
+        if changed:
+            vectors = self._embedding.embed_documents(
+                [knowledge_text(item.get("content") or {}, item.get("title") or "") for item, _ in changed]
+            )
+            embedding_model = self._embedding.model_name
+            for (item, fingerprint), vector in zip(changed, vectors):
+                self._database.upsert_embedding(
+                    item["id"], fingerprint, vector, model=embedding_model
+                )
+                enriched.append({**item, "embedding": vector})
+        semantic_model = self._embedding.using_semantic_model
+        relations = discover_relations(enriched, semantic_model=semantic_model)
+        self._database.replace_discovered_relations(relations)
+        granular = granularity_candidates(
+            enriched,
+            relations,
+            document_embedder=self._embedding.embed_document,
+            semantic_model=semantic_model,
+        )
+        self._database.replace_granularity_candidates(granular)
+        return {
+            "knowledge_count": len(documents),
+            "embedding_count": len(enriched),
+            "relation_count": len(relations),
+            "granularity_candidate_count": len(granular),
+            "embedding": self._embedding.status(),
+        }
+
+    def semantic_search(self, query: str, limit: int = 10) -> dict:
+        query = " ".join(str(query or "").split()).strip()
+        if not query:
+            raise ValueError("请先输入要检索的内容。")
+        self.refresh_intelligence()
+        documents = self._database.list_knowledge_documents(1000) if self._vault else self._database.list_all_knowledge()
+        embeddings = self._database.list_embeddings()
+        items = [
+            {**item, "embedding": (embeddings.get(item["id"]) or {}).get("vector", [])}
+            for item in documents
+        ]
+        matches = semantic_candidates(
+            query,
+            items,
+            limit,
+            query_embedder=self._embedding.embed_query,
+            document_embedder=self._embedding.embed_document,
+            semantic_model=self._embedding.using_semantic_model,
+        )
+        return {
+            "query": query,
+            "items": matches,
+            "total": len(matches),
+            "embedding": self._embedding.status(),
+        }
+
+    def knowledge_answer(self, question: str) -> dict:
+        question = " ".join(str(question or "").split()).strip()
+        if not question:
+            raise ValueError("请先告诉 Liora 你想问什么。")
+        self.refresh_intelligence()
+        documents = self._database.list_knowledge_documents(1000) if self._vault else self._database.list_all_knowledge()
+        embeddings = self._database.list_embeddings()
+        items = [
+            {**item, "embedding": (embeddings.get(item["id"]) or {}).get("vector", [])}
+            for item in documents
+        ]
+        candidates = semantic_candidates(
+            question,
+            items,
+            5,
+            query_embedder=self._embedding.embed_query,
+            document_embedder=self._embedding.embed_document,
+            semantic_model=self._embedding.using_semantic_model,
+        )
+        by_id = {item["id"]: item for item in items}
+        evidence = []
+        for candidate in candidates[:3]:
+            item = by_id[candidate["knowledge_id"]]
+            excerpt = str((item.get("content") or {}).get("core_insight") or "").strip()
+            if excerpt:
+                evidence.append({**candidate, "excerpt": excerpt[:500]})
+        minimum = 0.28 if self._embedding.using_semantic_model else 0.12
+        answer = (
+            "Liora 暂时没有在当前知识库里找到足够相关的依据。"
+            if not evidence or evidence[0]["score"] < minimum
+            else "\n\n".join(f"《{item['title']}》：{item['excerpt']}" for item in evidence)
+        )
+        return {
+            "question": question,
+            "answer": answer,
+            "evidence": evidence,
+            "provider": "local",
+            "embedding": self._embedding.status(),
+        }
+
+    def relations(self, status: str = "", limit: int = 100) -> dict:
+        self.refresh_intelligence()
+        items = self._database.list_relations(status, limit)
+        documents = {
+            item["id"]: item
+            for item in (self._database.list_knowledge_documents(1000) if self._vault else self._database.list_all_knowledge())
+        }
+        for item in items:
+            item["source"] = {key: documents.get(item["source_id"], {}).get(key) for key in ("id", "title", "relative_path")}
+            item["target"] = {key: documents.get(item["target_id"], {}).get(key) for key in ("id", "title", "relative_path")}
+        return {"items": items, "total": len(items)}
+
+    def update_relation(self, relation_id: str, status: str) -> dict:
+        return self._database.set_relation_status(relation_id, status)
+
+    def granularity(self, status: str = "candidate", limit: int = 40) -> dict:
+        self.refresh_intelligence()
+        items = self._database.list_granularity_candidates(status, limit)
+        documents = {
+            item["id"]: item
+            for item in (self._database.list_knowledge_documents(1000) if self._vault else self._database.list_all_knowledge())
+        }
+        for item in items:
+            item["sources"] = [
+                {
+                    "id": source_id,
+                    "title": documents.get(source_id, {}).get("title") or "未知知识",
+                    "path": documents.get(source_id, {}).get("relative_path") or "",
+                }
+                for source_id in item["source_ids"]
+            ]
+        hierarchy = self._database.list_hierarchy()
+        for edge in hierarchy:
+            edge["parent"] = {
+                "id": edge["parent_id"],
+                "title": documents.get(edge["parent_id"], {}).get("title") or "未知知识",
+                "path": documents.get(edge["parent_id"], {}).get("relative_path") or "",
+            }
+            edge["child"] = {
+                "id": edge["child_id"],
+                "title": documents.get(edge["child_id"], {}).get("title") or "未知知识",
+                "path": documents.get(edge["child_id"], {}).get("relative_path") or "",
+            }
+        return {"items": items, "total": len(items), "hierarchy": hierarchy}
+
+    def reject_granularity(self, candidate_id: str) -> dict:
+        return self._database.set_granularity_status(candidate_id, "rejected")
+
+    def apply_granularity(self, candidate_id: str) -> dict:
+        if not self._vault:
+            raise ValueError("请先连接 Obsidian Vault。")
+        candidate = next(
+            (
+                item
+                for item in self._database.list_granularity_candidates("candidate", 100)
+                if item["id"] == candidate_id
+            ),
+            None,
+        )
+        if not candidate:
+            raise LookupError("没有找到这条待确认的粒度建议。")
+        if candidate["kind"] == "merge":
+            # A merge approval records the structural decision without deleting
+            # either source. Destructive consolidation remains a future step.
+            return self._database.set_granularity_status(candidate_id, "confirmed")
+        parent_id = candidate["source_ids"][0]
+        parent = self._get_knowledge(parent_id)
+        if not parent:
+            raise LookupError("没有找到要拆分的上位知识。")
+        created = []
+        for child in candidate["proposal"].get("children", [])[:4]:
+            title = str(child.get("title") or "").strip()[:80]
+            seed = str(child.get("seed") or "").strip()
+            if not title or not seed:
+                continue
+            child_id = str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"liora:child:{parent_id}:{title.casefold()}")
+            )
+            existing = self._get_knowledge(child_id)
+            now = utc_now()
+            proposed = {
+                "id": child_id,
+                "title": title,
+                "created_at": existing["created_at"] if existing else now,
+                "updated_at": now,
+                "version": int(existing.get("version") or 0) + 1 if existing else 1,
+                "content": {
+                    "title": title,
+                    "core_insight": seed,
+                    "key_points": [seed],
+                    "logic_chain": [],
+                    "examples": [],
+                    "extensions": [],
+                    "boundaries": [],
+                    "connections": [f"上位知识：{parent['title']}"],
+                    "open_questions": [],
+                    "next_step": "继续通过复述补全这个子知识。",
+                    "sources": [],
+                },
+            }
+            knowledge = self._vault.write(proposed)
+            self._database.add_hierarchy(parent_id, knowledge["id"], "split")
+            created.append(knowledge)
+        resolved = self._database.set_granularity_status(candidate_id, "applied")
+        self.refresh_intelligence(scan_vault=False)
+        return {**resolved, "created": created, "parent": parent}
 
     def discard(self, session_id: str) -> dict:
         session = self._require_active_session(session_id)

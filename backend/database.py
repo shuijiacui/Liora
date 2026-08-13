@@ -2,8 +2,9 @@ import sqlite3
 import threading
 import uuid
 import json
+import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -32,7 +33,13 @@ class ReflectionDatabase:
                     started_at TEXT NOT NULL,
                     completed_at TEXT,
                     status TEXT NOT NULL CHECK (status IN ('active', 'completed')),
-                    summary TEXT NOT NULL DEFAULT ''
+                    summary TEXT NOT NULL DEFAULT '',
+                    knowledge_id TEXT,
+                    session_type TEXT NOT NULL DEFAULT 'reflection',
+                    prompt_id TEXT,
+                    prompt_kind TEXT,
+                    prompt_text TEXT,
+                    prompt_reason TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS reflection_messages (
@@ -90,6 +97,7 @@ class ReflectionDatabase:
                     file_size INTEGER NOT NULL,
                     content_hash TEXT NOT NULL,
                     source TEXT NOT NULL,
+                    object_type TEXT NOT NULL DEFAULT '',
                     indexed_at TEXT NOT NULL,
                     deleted_at TEXT
                 );
@@ -99,6 +107,129 @@ class ReflectionDatabase:
 
                 CREATE INDEX IF NOT EXISTS idx_knowledge_documents_hash
                 ON knowledge_documents(content_hash);
+
+                CREATE TABLE IF NOT EXISTS knowledge_states (
+                    knowledge_id TEXT PRIMARY KEY,
+                    last_reflected_at TEXT,
+                    next_entry_at TEXT,
+                    reflection_count INTEGER NOT NULL DEFAULT 0,
+                    last_rating TEXT,
+                    difficulty REAL NOT NULL DEFAULT 0.5,
+                    stability_days REAL NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_knowledge_states_due
+                ON knowledge_states(next_entry_at);
+
+                CREATE TABLE IF NOT EXISTS reflection_prompt_states (
+                    prompt_id TEXT PRIMARY KEY,
+                    knowledge_id TEXT NOT NULL,
+                    last_skipped_at TEXT,
+                    last_started_at TEXT,
+                    snoozed_until TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS learning_events (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL UNIQUE,
+                    knowledge_id TEXT NOT NULL,
+                    prompt_id TEXT NOT NULL,
+                    prompt_kind TEXT NOT NULL,
+                    rating TEXT NOT NULL,
+                    independent_recall INTEGER,
+                    hint_count INTEGER,
+                    misconception_count INTEGER,
+                    knowledge_changed INTEGER NOT NULL DEFAULT 1,
+                    occurred_at TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES reflection_sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_learning_events_knowledge
+                ON learning_events(knowledge_id, occurred_at DESC);
+
+                CREATE TABLE IF NOT EXISTS knowledge_changesets (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    action TEXT NOT NULL,
+                    target_id TEXT,
+                    target_path TEXT,
+                    status TEXT NOT NULL,
+                    risk TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    alignment_json TEXT NOT NULL DEFAULT '{}',
+                    before_json TEXT,
+                    after_json TEXT NOT NULL,
+                    diff_json TEXT NOT NULL DEFAULT '[]',
+                    before_markdown TEXT,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    applied_at TEXT,
+                    rolled_back_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_knowledge_changesets_status
+                ON knowledge_changesets(status, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS knowledge_embeddings (
+                    knowledge_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    vector_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS alignment_judgments (
+                    signature TEXT PRIMARY KEY,
+                    model TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS knowledge_relations (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_id, target_id, label)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_knowledge_relations_status
+                ON knowledge_relations(status, kind, confidence DESC);
+
+                CREATE TABLE IF NOT EXISTS granularity_candidates (
+                    id TEXT PRIMARY KEY,
+                    signature TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL,
+                    source_ids_json TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    reasons_json TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_granularity_candidates_status
+                ON granularity_candidates(status, score DESC);
+
+                CREATE TABLE IF NOT EXISTS knowledge_hierarchy (
+                    parent_id TEXT NOT NULL,
+                    child_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(parent_id, child_id)
+                );
                 """
             )
             session_columns = {
@@ -109,6 +240,23 @@ class ReflectionDatabase:
                 self._connection.execute(
                     "ALTER TABLE reflection_sessions ADD COLUMN knowledge_id TEXT"
                 )
+            session_migrations = {
+                "session_type": (
+                    "ALTER TABLE reflection_sessions ADD COLUMN "
+                    "session_type TEXT NOT NULL DEFAULT 'reflection'"
+                ),
+                "prompt_id": "ALTER TABLE reflection_sessions ADD COLUMN prompt_id TEXT",
+                "prompt_kind": "ALTER TABLE reflection_sessions ADD COLUMN prompt_kind TEXT",
+                "prompt_text": "ALTER TABLE reflection_sessions ADD COLUMN prompt_text TEXT",
+                "prompt_reason": "ALTER TABLE reflection_sessions ADD COLUMN prompt_reason TEXT",
+            }
+            for column, statement in session_migrations.items():
+                if column not in session_columns:
+                    self._connection.execute(statement)
+            self._connection.execute(
+                "UPDATE reflection_sessions SET session_type = 'review' "
+                "WHERE prompt_id IS NOT NULL AND prompt_id != ''"
+            )
             document_columns = {
                 row["name"]
                 for row in self._connection.execute("PRAGMA table_info(knowledge_documents)").fetchall()
@@ -117,10 +265,18 @@ class ReflectionDatabase:
                 "folder": "ALTER TABLE knowledge_documents ADD COLUMN folder TEXT NOT NULL DEFAULT ''",
                 "tags_json": "ALTER TABLE knowledge_documents ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'",
                 "search_text": "ALTER TABLE knowledge_documents ADD COLUMN search_text TEXT NOT NULL DEFAULT ''",
+                "object_type": "ALTER TABLE knowledge_documents ADD COLUMN object_type TEXT NOT NULL DEFAULT ''",
             }
             for column, statement in document_migrations.items():
                 if column not in document_columns:
                     self._connection.execute(statement)
+            # The Vault boundary defines knowledge membership. Upgrade notes
+            # indexed by earlier versions, which treated frontmatter markers as
+            # a Knowledge Object admission check.
+            self._connection.execute(
+                "UPDATE knowledge_documents SET object_type = 'knowledge' "
+                "WHERE object_type = '' OR object_type = 'note'"
+            )
             self._connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_knowledge_documents_folder
@@ -148,7 +304,16 @@ class ReflectionDatabase:
                 """
             )
 
-    def create_session(self, knowledge_id: str | None = None) -> dict:
+    def create_session(
+        self,
+        knowledge_id: str | None = None,
+        prompt: dict | None = None,
+        session_type: str = "reflection",
+    ) -> dict:
+        prompt = prompt or {}
+        normalized_type = str(session_type or "reflection").strip().lower()
+        if normalized_type not in {"reflection", "review"}:
+            raise ValueError("不支持的会话类型。")
         session = {
             "id": str(uuid.uuid4()),
             "started_at": utc_now(),
@@ -156,14 +321,21 @@ class ReflectionDatabase:
             "status": "active",
             "summary": "",
             "knowledge_id": knowledge_id,
+            "session_type": normalized_type,
+            "prompt_id": prompt.get("id"),
+            "prompt_kind": prompt.get("kind"),
+            "prompt_text": prompt.get("prompt"),
+            "prompt_reason": prompt.get("reason"),
         }
         with self._lock, self._connection:
             self._connection.execute(
                 """
                 INSERT INTO reflection_sessions
-                    (id, started_at, completed_at, status, summary, knowledge_id)
+                    (id, started_at, completed_at, status, summary, knowledge_id,
+                     session_type, prompt_id, prompt_kind, prompt_text, prompt_reason)
                 VALUES
-                    (:id, :started_at, :completed_at, :status, :summary, :knowledge_id)
+                    (:id, :started_at, :completed_at, :status, :summary, :knowledge_id,
+                     :session_type, :prompt_id, :prompt_kind, :prompt_text, :prompt_reason)
                 """,
                 session,
             )
@@ -176,16 +348,27 @@ class ReflectionDatabase:
             ).fetchone()
         return dict(row) if row else None
 
-    def get_active_session(self) -> dict | None:
+    def get_active_session(self, session_type: str | None = None) -> dict | None:
         with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT * FROM reflection_sessions
-                WHERE status = 'active'
-                ORDER BY started_at DESC
-                LIMIT 1
-                """
-            ).fetchone()
+            if session_type:
+                row = self._connection.execute(
+                    """
+                    SELECT * FROM reflection_sessions
+                    WHERE status = 'active' AND session_type = ?
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (session_type,),
+                ).fetchone()
+            else:
+                row = self._connection.execute(
+                    """
+                    SELECT * FROM reflection_sessions
+                    WHERE status = 'active'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
         return dict(row) if row else None
 
     def add_message(self, session_id: str, role: str, content: str) -> dict:
@@ -291,6 +474,35 @@ class ReflectionDatabase:
                 "DELETE FROM knowledge_drafts WHERE session_id = ?", (session_id,)
             )
 
+    def complete_session_after_changeset(
+        self,
+        session_id: str,
+        knowledge_id: str | None,
+        summary: str,
+    ) -> dict:
+        now = utc_now()
+        with self._lock, self._connection:
+            session = self._connection.execute(
+                "SELECT * FROM reflection_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if not session:
+                raise LookupError("没有找到这次反思记录。")
+            self._connection.execute(
+                """
+                UPDATE reflection_sessions
+                SET status = 'completed', completed_at = ?, summary = ?, knowledge_id = ?
+                WHERE id = ?
+                """,
+                (now, summary, knowledge_id, session_id),
+            )
+            self._connection.execute(
+                "DELETE FROM knowledge_drafts WHERE session_id = ?", (session_id,)
+            )
+            self._connection.execute(
+                "DELETE FROM reflection_messages WHERE session_id = ?", (session_id,)
+            )
+        return self.get_session(session_id)
+
     def discard_session(self, session_id: str) -> dict:
         with self._lock, self._connection:
             session = self._connection.execute(
@@ -300,6 +512,11 @@ class ReflectionDatabase:
                 raise LookupError("没有找到这次反思记录。")
             if session["status"] != "active":
                 raise ValueError("已经完成的反思不能放弃。")
+            if session["prompt_id"]:
+                self._connection.execute(
+                    "UPDATE reflection_prompt_states SET snoozed_until = NULL, updated_at = ? WHERE prompt_id = ?",
+                    (utc_now(), session["prompt_id"]),
+                )
             self._connection.execute(
                 "DELETE FROM reflection_sessions WHERE id = ?", (session_id,)
             )
@@ -444,8 +661,8 @@ class ReflectionDatabase:
                 INSERT INTO knowledge_documents (
                     id, relative_path, title, created_at, updated_at, version,
                     content_json, file_mtime_ns, file_size, content_hash,
-                    source, indexed_at, folder, tags_json, search_text, deleted_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    source, object_type, indexed_at, folder, tags_json, search_text, deleted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 ON CONFLICT(id) DO UPDATE SET
                     relative_path = excluded.relative_path,
                     title = excluded.title,
@@ -457,6 +674,7 @@ class ReflectionDatabase:
                     file_size = excluded.file_size,
                     content_hash = excluded.content_hash,
                     source = excluded.source,
+                    object_type = excluded.object_type,
                     indexed_at = excluded.indexed_at,
                     folder = excluded.folder,
                     tags_json = excluded.tags_json,
@@ -475,6 +693,7 @@ class ReflectionDatabase:
                     int(item["file_size"]),
                     item["content_hash"],
                     item["source"],
+                    item.get("object_type", "knowledge"),
                     item["indexed_at"],
                     item.get("folder", ""),
                     tags_json,
@@ -654,6 +873,786 @@ class ReflectionDatabase:
                     "SELECT COUNT(*) FROM knowledge_documents WHERE deleted_at IS NULL"
                 ).fetchone()[0]
             )
+
+    def knowledge_dashboard(self, recent_limit: int = 5, question_limit: int = 5) -> dict:
+        safe_recent_limit = min(max(int(recent_limit), 1), 20)
+        safe_question_limit = min(max(int(question_limit), 1), 20)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM knowledge_documents
+                WHERE deleted_at IS NULL
+                ORDER BY updated_at DESC, title COLLATE NOCASE ASC
+                """
+            ).fetchall()
+
+        items = [self._document_payload(row) for row in rows]
+        recent = [
+            {
+                "id": item["id"],
+                "title": item["title"],
+                "path": item["relative_path"],
+                "updated_at": item["updated_at"],
+                "summary": str(item.get("content", {}).get("core_insight") or "")[:240],
+                "object_type": item.get("object_type") or "knowledge",
+            }
+            for item in items[:safe_recent_limit]
+        ]
+        open_questions = []
+        for item in items:
+            for question in item.get("content", {}).get("open_questions", []):
+                value = str(question).strip()
+                if not value:
+                    continue
+                open_questions.append(
+                    {
+                        "knowledge_id": item["id"],
+                        "title": item["title"],
+                        "path": item["relative_path"],
+                        "question": value,
+                    }
+                )
+                if len(open_questions) >= safe_question_limit:
+                    break
+            if len(open_questions) >= safe_question_limit:
+                break
+
+        health = self.knowledge_health([item["id"] for item in items])
+        return {
+            "knowledge_count": len(items),
+            "open_question_count": sum(
+                len(item.get("content", {}).get("open_questions", [])) for item in items
+            ),
+            "recent": recent,
+            "open_questions": open_questions,
+            "health": health,
+        }
+
+    def knowledge_prompt_candidates(self, limit: int = 8) -> list[dict]:
+        safe_limit = min(max(int(limit), 1), 20)
+        now = utc_now()
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM knowledge_documents
+                WHERE deleted_at IS NULL
+                ORDER BY updated_at DESC, title COLLATE NOCASE ASC
+                """
+            ).fetchall()
+            prompt_states = {
+                row["prompt_id"]: dict(row)
+                for row in self._connection.execute(
+                    "SELECT * FROM reflection_prompt_states"
+                ).fetchall()
+            }
+            knowledge_states = {
+                row["knowledge_id"]: dict(row)
+                for row in self._connection.execute(
+                    "SELECT * FROM knowledge_states"
+                ).fetchall()
+            }
+
+        candidates = []
+        for row in rows:
+            item = self._document_payload(row)
+            context = str(item.get("content", {}).get("core_insight") or "").strip()[:240]
+            for question in item.get("content", {}).get("open_questions", []):
+                prompt = str(question).strip()
+                if not prompt:
+                    continue
+                prompt_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"liora:knowledge-gap:{item['id']}:{prompt}",
+                    )
+                )
+                prompt_state = prompt_states.get(prompt_id, {})
+                knowledge_state = knowledge_states.get(item["id"], {})
+                snoozed_until = prompt_state.get("snoozed_until")
+                next_entry_at = knowledge_state.get("next_entry_at")
+                if snoozed_until and snoozed_until > now:
+                    continue
+                if next_entry_at and next_entry_at > now:
+                    continue
+                candidates.append(
+                    {
+                        "id": prompt_id,
+                        "kind": "knowledge_gap",
+                        "knowledge_id": item["id"],
+                        "title": item["title"],
+                        "path": item["relative_path"],
+                        "context": context,
+                        "prompt": prompt,
+                        "reason_code": "open_question",
+                        "reason": (
+                            f"这个问题来自《{item['title']}》的“尚待探索”。"
+                            "Liora没有额外猜测你的掌握程度。"
+                        ),
+                        "schedule": {
+                            "reflection_count": int(knowledge_state.get("reflection_count") or 0),
+                            "last_rating": knowledge_state.get("last_rating"),
+                            "next_entry_at": next_entry_at,
+                            "difficulty": float(knowledge_state.get("difficulty") or 0.5),
+                            "stability_days": float(knowledge_state.get("stability_days") or 0),
+                            "retrievability": self._retrievability(knowledge_state),
+                        },
+                        "_last_skipped_at": prompt_state.get("last_skipped_at") or "",
+                    }
+                )
+        candidates.sort(
+            key=lambda candidate: (
+                bool(candidate["_last_skipped_at"]),
+                candidate["_last_skipped_at"],
+            )
+        )
+        for candidate in candidates:
+            candidate.pop("_last_skipped_at", None)
+        return candidates[:safe_limit]
+
+    def schedule_prompt_candidates(self, candidates: list[dict], limit: int = 8) -> list[dict]:
+        safe_limit = min(max(int(limit), 1), 20)
+        now = utc_now()
+        with self._lock:
+            prompt_states = {
+                row["prompt_id"]: dict(row)
+                for row in self._connection.execute("SELECT * FROM reflection_prompt_states").fetchall()
+            }
+            knowledge_states = {
+                row["knowledge_id"]: dict(row)
+                for row in self._connection.execute("SELECT * FROM knowledge_states").fetchall()
+            }
+        scheduled = []
+        for candidate in candidates:
+            prompt_state = prompt_states.get(candidate["id"], {})
+            knowledge_state = knowledge_states.get(candidate["knowledge_id"], {})
+            snoozed_until = prompt_state.get("snoozed_until")
+            next_entry_at = knowledge_state.get("next_entry_at")
+            if snoozed_until and snoozed_until > now:
+                continue
+            if next_entry_at and next_entry_at > now:
+                continue
+            scheduled.append({
+                **candidate,
+                "schedule": {
+                    "reflection_count": int(knowledge_state.get("reflection_count") or 0),
+                    "last_rating": knowledge_state.get("last_rating"),
+                    "next_entry_at": next_entry_at,
+                    "difficulty": float(knowledge_state.get("difficulty") or 0.5),
+                    "stability_days": float(knowledge_state.get("stability_days") or 0),
+                    "retrievability": self._retrievability(knowledge_state),
+                },
+                "_last_skipped_at": prompt_state.get("last_skipped_at") or "",
+            })
+        scheduled.sort(key=lambda item: (bool(item["_last_skipped_at"]), item["_last_skipped_at"]))
+        for item in scheduled:
+            item.pop("_last_skipped_at", None)
+        return scheduled[:safe_limit]
+
+    def mark_prompt_skipped(self, prompt_id: str, knowledge_id: str) -> dict:
+        now = utc_now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO reflection_prompt_states
+                    (prompt_id, knowledge_id, last_skipped_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(prompt_id) DO UPDATE SET
+                    knowledge_id = excluded.knowledge_id,
+                    last_skipped_at = excluded.last_skipped_at,
+                    updated_at = excluded.updated_at
+                """,
+                (prompt_id, knowledge_id, now, now),
+            )
+        return {"prompt_id": prompt_id, "skipped_at": now}
+
+    def snooze_prompt(self, prompt_id: str, knowledge_id: str, days: int = 3) -> dict:
+        now = datetime.now(timezone.utc)
+        until = (now + timedelta(days=min(max(int(days), 1), 30))).isoformat(timespec="seconds")
+        now_text = now.isoformat(timespec="seconds")
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO reflection_prompt_states
+                    (prompt_id, knowledge_id, snoozed_until, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(prompt_id) DO UPDATE SET
+                    knowledge_id = excluded.knowledge_id,
+                    snoozed_until = excluded.snoozed_until,
+                    updated_at = excluded.updated_at
+                """,
+                (prompt_id, knowledge_id, until, now_text),
+            )
+        return {"prompt_id": prompt_id, "snoozed_until": until}
+
+    def mark_prompt_started(self, prompt_id: str, knowledge_id: str) -> None:
+        now = datetime.now(timezone.utc)
+        # Keep the same card from resurfacing while its reflection is unfinished.
+        until = (now + timedelta(days=1)).isoformat(timespec="seconds")
+        now_text = now.isoformat(timespec="seconds")
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO reflection_prompt_states
+                    (prompt_id, knowledge_id, last_started_at, snoozed_until, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(prompt_id) DO UPDATE SET
+                    knowledge_id = excluded.knowledge_id,
+                    last_started_at = excluded.last_started_at,
+                    snoozed_until = excluded.snoozed_until,
+                    updated_at = excluded.updated_at
+                """,
+                (prompt_id, knowledge_id, now_text, until, now_text),
+            )
+
+    def record_learning_event(
+        self,
+        session_id: str,
+        rating: str,
+        independent_recall: bool | None = None,
+        hint_count: int | None = None,
+        misconception_count: int | None = None,
+    ) -> dict:
+        normalized = str(rating or "").strip().lower()
+        if normalized not in {"again", "hard", "good", "easy"}:
+            raise ValueError("复述结果必须是 again、hard、good 或 easy。")
+        with self._lock, self._connection:
+            existing = self._connection.execute(
+                "SELECT * FROM learning_events WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if existing:
+                event = self._learning_event_payload(existing)
+                state = self._connection.execute(
+                    "SELECT * FROM knowledge_states WHERE knowledge_id = ?",
+                    (event["knowledge_id"],),
+                ).fetchone()
+                return {
+                    **event,
+                    "knowledge_state": self._knowledge_state_payload(state) if state else None,
+                }
+            session = self._connection.execute(
+                "SELECT * FROM reflection_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if not session:
+                raise LookupError("没有找到这次复述。")
+            if session["status"] != "completed":
+                raise ValueError("请先确认知识整理结果，再评价这次复述。")
+            if not session["prompt_id"] or not session["knowledge_id"]:
+                raise ValueError("这次不是由知识问题发起的复述，不需要安排复习。")
+
+            state = self._connection.execute(
+                "SELECT * FROM knowledge_states WHERE knowledge_id = ?",
+                (session["knowledge_id"],),
+            ).fetchone()
+            previous_stability = float(state["stability_days"] or 0) if state else 0.0
+            previous_difficulty = float(state["difficulty"] or 0.5) if state else 0.5
+            first_intervals = {"again": 1 / 6, "hard": 1.0, "good": 3.0, "easy": 7.0}
+            if previous_stability <= 0:
+                stability = first_intervals[normalized]
+            else:
+                factors = {"again": 0.5, "hard": 1.2, "good": 2.0, "easy": 3.0}
+                floors = {"again": 1 / 6, "hard": 1.0, "good": 3.0, "easy": 7.0}
+                stability = max(floors[normalized], previous_stability * factors[normalized])
+            stability = min(stability, 365.0)
+            difficulty_delta = {"again": 0.10, "hard": 0.05, "good": -0.04, "easy": -0.08}
+            difficulty = min(max(previous_difficulty + difficulty_delta[normalized], 0.05), 0.95)
+            occurred = datetime.now(timezone.utc)
+            occurred_text = occurred.isoformat(timespec="seconds")
+            next_entry = (occurred + timedelta(days=stability)).isoformat(timespec="seconds")
+            count = int(state["reflection_count"] or 0) + 1 if state else 1
+            event = {
+                "id": str(uuid.uuid4()),
+                "session_id": session_id,
+                "knowledge_id": session["knowledge_id"],
+                "prompt_id": session["prompt_id"],
+                "prompt_kind": session["prompt_kind"] or "knowledge_gap",
+                "rating": normalized,
+                "independent_recall": None if independent_recall is None else int(independent_recall),
+                "hint_count": None if hint_count is None else max(int(hint_count), 0),
+                "misconception_count": (
+                    None if misconception_count is None else max(int(misconception_count), 0)
+                ),
+                "knowledge_changed": 1,
+                "occurred_at": occurred_text,
+            }
+            self._connection.execute(
+                """
+                INSERT INTO learning_events
+                    (id, session_id, knowledge_id, prompt_id, prompt_kind, rating,
+                     independent_recall, hint_count, misconception_count,
+                     knowledge_changed, occurred_at)
+                VALUES
+                    (:id, :session_id, :knowledge_id, :prompt_id, :prompt_kind, :rating,
+                     :independent_recall, :hint_count, :misconception_count,
+                     :knowledge_changed, :occurred_at)
+                """,
+                event,
+            )
+            self._connection.execute(
+                """
+                INSERT INTO knowledge_states
+                    (knowledge_id, last_reflected_at, next_entry_at, reflection_count,
+                     last_rating, difficulty, stability_days, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(knowledge_id) DO UPDATE SET
+                    last_reflected_at = excluded.last_reflected_at,
+                    next_entry_at = excluded.next_entry_at,
+                    reflection_count = excluded.reflection_count,
+                    last_rating = excluded.last_rating,
+                    difficulty = excluded.difficulty,
+                    stability_days = excluded.stability_days,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session["knowledge_id"], occurred_text, next_entry, count,
+                    normalized, difficulty, stability, occurred_text,
+                ),
+            )
+            self._connection.execute(
+                "UPDATE reflection_prompt_states SET snoozed_until = NULL, updated_at = ? WHERE prompt_id = ?",
+                (occurred_text, session["prompt_id"]),
+            )
+        return {
+            **self._learning_event_payload(event),
+            "knowledge_state": self._knowledge_state_payload({
+                "knowledge_id": session["knowledge_id"],
+                "last_reflected_at": occurred_text,
+                "next_entry_at": next_entry,
+                "reflection_count": count,
+                "last_rating": normalized,
+                "difficulty": difficulty,
+                "stability_days": stability,
+            }),
+        }
+
+    def knowledge_health(self, knowledge_ids: list[str]) -> dict:
+        if not knowledge_ids:
+            return {"growing": 0, "stable": 0, "due": 0}
+        now = utc_now()
+        with self._lock:
+            states = {
+                row["knowledge_id"]: dict(row)
+                for row in self._connection.execute("SELECT * FROM knowledge_states").fetchall()
+            }
+        growing = 0
+        stable = 0
+        due = 0
+        for knowledge_id in knowledge_ids:
+            state = states.get(knowledge_id)
+            if not state or int(state.get("reflection_count") or 0) < 3:
+                growing += 1
+            else:
+                stable += 1
+            if not state or not state.get("next_entry_at") or state["next_entry_at"] <= now:
+                due += 1
+        return {"growing": growing, "stable": stable, "due": due}
+
+    def create_changeset(self, value: dict) -> dict:
+        now = utc_now()
+        changeset = {
+            "id": value.get("id") or str(uuid.uuid4()),
+            "session_id": value.get("session_id"),
+            "action": value["action"],
+            "target_id": value.get("target_id"),
+            "target_path": value.get("target_path"),
+            "status": value.get("status") or "pending",
+            "risk": value.get("risk") or "review",
+            "title": value.get("title") or "未命名变更",
+            "reason": value.get("reason") or "",
+            "alignment_json": json.dumps(value.get("alignment") or {}, ensure_ascii=False),
+            "before_json": (
+                json.dumps(value["before"], ensure_ascii=False)
+                if value.get("before") is not None
+                else None
+            ),
+            "after_json": json.dumps(value.get("after") or {}, ensure_ascii=False),
+            "diff_json": json.dumps(value.get("diff") or [], ensure_ascii=False),
+            "before_markdown": value.get("before_markdown"),
+            "result_json": None,
+            "created_at": now,
+            "resolved_at": None,
+            "applied_at": None,
+            "rolled_back_at": None,
+        }
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO knowledge_changesets (
+                    id, session_id, action, target_id, target_path, status, risk,
+                    title, reason, alignment_json, before_json, after_json,
+                    diff_json, before_markdown, result_json, created_at,
+                    resolved_at, applied_at, rolled_back_at
+                ) VALUES (
+                    :id, :session_id, :action, :target_id, :target_path, :status, :risk,
+                    :title, :reason, :alignment_json, :before_json, :after_json,
+                    :diff_json, :before_markdown, :result_json, :created_at,
+                    :resolved_at, :applied_at, :rolled_back_at
+                )
+                """,
+                changeset,
+            )
+        return self.get_changeset(changeset["id"])
+
+    def get_changeset(self, changeset_id: str) -> dict | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM knowledge_changesets WHERE id = ?", (changeset_id,)
+            ).fetchone()
+        return self._changeset_payload(row) if row else None
+
+    def list_changesets(self, status: str = "pending", limit: int = 30) -> list[dict]:
+        safe_limit = min(max(int(limit), 1), 100)
+        normalized = str(status or "").strip().lower()
+        with self._lock:
+            if normalized in {"pending", "applied", "rejected", "rolled_back"}:
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM knowledge_changesets
+                    WHERE status = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (normalized, safe_limit),
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    "SELECT * FROM knowledge_changesets ORDER BY created_at DESC LIMIT ?",
+                    (safe_limit,),
+                ).fetchall()
+        return [self._changeset_payload(row) for row in rows]
+
+    def resolve_changeset(
+        self,
+        changeset_id: str,
+        status: str,
+        result: dict | None = None,
+    ) -> dict:
+        if status not in {"applied", "rejected", "rolled_back"}:
+            raise ValueError("不支持的 ChangeSet 状态。")
+        now = utc_now()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM knowledge_changesets WHERE id = ?", (changeset_id,)
+            ).fetchone()
+            if not row:
+                raise LookupError("没有找到这条知识变更。")
+            self._connection.execute(
+                """
+                UPDATE knowledge_changesets
+                SET status = ?, result_json = ?, resolved_at = ?,
+                    applied_at = CASE WHEN ? = 'applied' THEN ? ELSE applied_at END,
+                    rolled_back_at = CASE WHEN ? = 'rolled_back' THEN ? ELSE rolled_back_at END
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    json.dumps(result or {}, ensure_ascii=False),
+                    now,
+                    status,
+                    now,
+                    status,
+                    now,
+                    changeset_id,
+                ),
+            )
+        return self.get_changeset(changeset_id)
+
+    def upsert_embedding(
+        self,
+        knowledge_id: str,
+        fingerprint: str,
+        vector: list[float],
+        model: str = "liora-local-ngram-v1",
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO knowledge_embeddings
+                    (knowledge_id, fingerprint, model, dimensions, vector_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(knowledge_id) DO UPDATE SET
+                    fingerprint = excluded.fingerprint,
+                    model = excluded.model,
+                    dimensions = excluded.dimensions,
+                    vector_json = excluded.vector_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    knowledge_id,
+                    fingerprint,
+                    model,
+                    len(vector),
+                    json.dumps(vector),
+                    utc_now(),
+                ),
+            )
+
+    def list_embeddings(self) -> dict[str, dict]:
+        with self._lock:
+            rows = self._connection.execute("SELECT * FROM knowledge_embeddings").fetchall()
+        return {
+            row["knowledge_id"]: {
+                **dict(row),
+                "vector": json.loads(row["vector_json"]),
+            }
+            for row in rows
+        }
+
+    def get_alignment_judgment(self, signature: str) -> dict | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT result_json FROM alignment_judgments WHERE signature = ?",
+                (signature,),
+            ).fetchone()
+        return json.loads(row["result_json"]) if row else None
+
+    def save_alignment_judgment(self, signature: str, model: str, result: dict) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO alignment_judgments (signature, model, result_json, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(signature) DO UPDATE SET
+                    model = excluded.model,
+                    result_json = excluded.result_json,
+                    created_at = excluded.created_at
+                """,
+                (signature, model, json.dumps(result, ensure_ascii=False), utc_now()),
+            )
+
+    def count_alignment_judgments_since(self, moment: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM alignment_judgments WHERE created_at >= ?",
+                (moment,),
+            ).fetchone()
+        return int(row[0])
+
+    def replace_discovered_relations(self, relations: list[dict]) -> None:
+        now = utc_now()
+        with self._lock, self._connection:
+            # Candidates are derived data. Rebuild them from scratch so a
+            # cleaner algorithm removes historical false positives. Preserve
+            # confirmed/rejected decisions made by the user.
+            self._connection.execute(
+                "DELETE FROM knowledge_relations WHERE status = 'candidate'"
+            )
+            for relation in relations:
+                left, right = sorted((relation["source_id"], relation["target_id"]))
+                relation_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"liora:relation:{left}:{right}:{relation['label']}",
+                    )
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO knowledge_relations (
+                        id, source_id, target_id, kind, label, confidence,
+                        reason, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source_id, target_id, label) DO UPDATE SET
+                        kind = excluded.kind,
+                        confidence = excluded.confidence,
+                        reason = excluded.reason,
+                        status = CASE
+                            WHEN knowledge_relations.status IN ('confirmed', 'rejected')
+                            THEN knowledge_relations.status
+                            ELSE excluded.status
+                        END,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        relation_id,
+                        left,
+                        right,
+                        relation["kind"],
+                        relation["label"],
+                        float(relation["confidence"]),
+                        relation["reason"],
+                        relation["status"],
+                        now,
+                        now,
+                    ),
+                )
+
+    def list_relations(self, status: str = "", limit: int = 100) -> list[dict]:
+        safe_limit = min(max(int(limit), 1), 300)
+        with self._lock:
+            if status:
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM knowledge_relations WHERE status = ?
+                    ORDER BY confidence DESC LIMIT ?
+                    """,
+                    (status, safe_limit),
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    "SELECT * FROM knowledge_relations ORDER BY confidence DESC LIMIT ?",
+                    (safe_limit,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_relation_status(self, relation_id: str, status: str) -> dict:
+        if status not in {"candidate", "confirmed", "rejected"}:
+            raise ValueError("不支持的关系状态。")
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE knowledge_relations SET status = ?, updated_at = ? WHERE id = ?",
+                (status, utc_now(), relation_id),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM knowledge_relations WHERE id = ?", (relation_id,)
+            ).fetchone()
+        if not row:
+            raise LookupError("没有找到这条知识关系。")
+        return dict(row)
+
+    def replace_granularity_candidates(self, candidates: list[dict]) -> None:
+        now = utc_now()
+        with self._lock, self._connection:
+            for candidate in candidates:
+                signature = json.dumps(
+                    [candidate["kind"], sorted(candidate["source_ids"])],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                candidate_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"liora:granularity:{signature}"))
+                self._connection.execute(
+                    """
+                    INSERT INTO granularity_candidates (
+                        id, signature, kind, source_ids_json, score, reasons_json,
+                        proposal_json, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'candidate', ?, ?)
+                    ON CONFLICT(signature) DO UPDATE SET
+                        score = excluded.score,
+                        reasons_json = excluded.reasons_json,
+                        proposal_json = excluded.proposal_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        candidate_id,
+                        signature,
+                        candidate["kind"],
+                        json.dumps(candidate["source_ids"], ensure_ascii=False),
+                        float(candidate["score"]),
+                        json.dumps(candidate["reasons"], ensure_ascii=False),
+                        json.dumps(candidate["proposal"], ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+
+    def list_granularity_candidates(self, status: str = "candidate", limit: int = 40) -> list[dict]:
+        safe_limit = min(max(int(limit), 1), 100)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM granularity_candidates
+                WHERE status = ?
+                ORDER BY score DESC LIMIT ?
+                """,
+                (status, safe_limit),
+            ).fetchall()
+        return [self._granularity_payload(row) for row in rows]
+
+    def set_granularity_status(self, candidate_id: str, status: str) -> dict:
+        if status not in {"candidate", "confirmed", "rejected", "applied"}:
+            raise ValueError("不支持的粒度候选状态。")
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE granularity_candidates SET status = ?, updated_at = ? WHERE id = ?",
+                (status, utc_now(), candidate_id),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM granularity_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+        if not row:
+            raise LookupError("没有找到这条粒度建议。")
+        return self._granularity_payload(row)
+
+    def add_hierarchy(self, parent_id: str, child_id: str, source: str = "review") -> None:
+        if parent_id == child_id:
+            raise ValueError("知识对象不能成为自己的子对象。")
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO knowledge_hierarchy
+                    (parent_id, child_id, source, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (parent_id, child_id, source, utc_now()),
+            )
+
+    def list_hierarchy(self) -> list[dict]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM knowledge_hierarchy ORDER BY created_at"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def remove_knowledge_intelligence(self, knowledge_id: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM knowledge_embeddings WHERE knowledge_id = ?", (knowledge_id,)
+            )
+            self._connection.execute(
+                "DELETE FROM knowledge_relations WHERE source_id = ? OR target_id = ?",
+                (knowledge_id, knowledge_id),
+            )
+            self._connection.execute(
+                "DELETE FROM knowledge_hierarchy WHERE parent_id = ? OR child_id = ?",
+                (knowledge_id, knowledge_id),
+            )
+
+    @staticmethod
+    def _learning_event_payload(row: sqlite3.Row | dict) -> dict:
+        value = dict(row)
+        for key in ("independent_recall", "knowledge_changed"):
+            if value.get(key) is not None:
+                value[key] = bool(value[key])
+        return value
+
+    @staticmethod
+    def _changeset_payload(row: sqlite3.Row | dict) -> dict:
+        value = dict(row)
+        for stored, public in (
+            ("alignment_json", "alignment"),
+            ("before_json", "before"),
+            ("after_json", "after"),
+            ("diff_json", "diff"),
+            ("result_json", "result"),
+        ):
+            raw = value.pop(stored, None)
+            value[public] = json.loads(raw) if raw else None
+        return value
+
+    @staticmethod
+    def _granularity_payload(row: sqlite3.Row | dict) -> dict:
+        value = dict(row)
+        value["source_ids"] = json.loads(value.pop("source_ids_json"))
+        value["reasons"] = json.loads(value.pop("reasons_json"))
+        value["proposal"] = json.loads(value.pop("proposal_json"))
+        return value
+
+    @staticmethod
+    def _retrievability(state: dict) -> float:
+        last_reflected = state.get("last_reflected_at")
+        stability = float(state.get("stability_days") or 0)
+        if not last_reflected or stability <= 0:
+            return 0.0
+        try:
+            moment = datetime.fromisoformat(str(last_reflected))
+            elapsed_days = max((datetime.now(timezone.utc) - moment).total_seconds() / 86400, 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return round(math.exp(-elapsed_days / stability), 4)
+
+    @classmethod
+    def _knowledge_state_payload(cls, row: sqlite3.Row | dict) -> dict:
+        value = dict(row)
+        value["retrievability"] = cls._retrievability(value)
+        return value
 
     def find_missing_document_by_hash(
         self, content_hash: str, active_paths: set[str]

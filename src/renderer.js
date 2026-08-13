@@ -10,6 +10,7 @@ const states = {
 const appElement = document.querySelector('#app');
 const featureRail = document.querySelector('#feature-rail');
 const featureButtons = [...document.querySelectorAll('[data-feature]')];
+const reviewBadge = document.querySelector('#review-badge');
 const interactionBubble = document.querySelector('#interaction-bubble');
 const interactionKicker = document.querySelector('#interaction-kicker');
 const currentMessage = document.querySelector('#current-message');
@@ -23,13 +24,18 @@ const reflectionActions = document.querySelector('#reflection-actions');
 const microphoneButton = document.querySelector('#microphone-button');
 const microphoneLabel = document.querySelector('#microphone-label');
 const finishButton = document.querySelector('#finish-button');
+const deferReviewButton = document.querySelector('#defer-review');
 const recordingState = document.querySelector('#recording-state');
 const recordingTimer = document.querySelector('#recording-timer');
 const confirmationActions = document.querySelector('#confirmation-actions');
+const ratingActions = document.querySelector('#rating-actions');
+const independentRecallInput = document.querySelector('#independent-recall');
+const ratingButtons = [...document.querySelectorAll('[data-reflection-rating]')];
 const confirmKnowledgeButton = document.querySelector('#confirm-knowledge');
 const continueReflectionButton = document.querySelector('#continue-reflection');
 const editKnowledgeButton = document.querySelector('#edit-knowledge');
 const discardKnowledgeButton = document.querySelector('#discard-knowledge');
+const deferReviewDraftButton = document.querySelector('#defer-review-draft');
 const draftEditor = document.querySelector('#draft-editor');
 const draftEditorActions = document.querySelector('#draft-editor-actions');
 const saveDraftButton = document.querySelector('#save-draft');
@@ -90,6 +96,9 @@ let hiddenSprite = document.querySelector('#sprite-next');
 let currentState = 'idle';
 let activeView = 'idle';
 let sessionId = null;
+let conversationView = 'reflection';
+let pendingReviewSessionId = null;
+const conversationDrafts = { reflection: '', review: '' };
 let busy = false;
 let drag = null;
 let knowledgeItems = [];
@@ -233,9 +242,14 @@ function setView(view) {
     clearTimeout(featureHideTimer);
     appElement.classList.remove('is-feature-visible');
   }
-  setHidden(composer, view !== 'reflection');
-  setHidden(reflectionActions, view !== 'reflection');
+  setHidden(composer, !['reflection', 'review'].includes(view));
+  setHidden(reflectionActions, !['reflection', 'review'].includes(view));
+  deferReviewButton.hidden = view !== 'review';
   setHidden(confirmationActions, view !== 'confirmation' || discardConfirming);
+  deferReviewDraftButton.hidden = view !== 'confirmation'
+    || conversationView !== 'review'
+    || discardConfirming;
+  setHidden(ratingActions, view !== 'rating');
   setHidden(discardConfirmationActions, view !== 'confirmation' || !discardConfirming);
   setHidden(draftEditorActions, view !== 'draft-edit');
   setHidden(draftEditor, view !== 'draft-edit');
@@ -361,8 +375,11 @@ function setBusy(value) {
   reviseDraftButton.disabled = value;
   cancelDraftEditButton.disabled = value;
   discardKnowledgeButton.disabled = value;
+  deferReviewDraftButton.disabled = value;
   confirmDiscardButton.disabled = value;
   cancelDiscardButton.disabled = value;
+  deferReviewButton.disabled = value;
+  ratingButtons.forEach((button) => { button.disabled = value; });
   closeInteractionButton.disabled = value;
 }
 
@@ -383,6 +400,9 @@ async function openShell(view) {
 
 async function closeInteraction() {
   if (busy) return;
+  if (['reflection', 'review'].includes(conversationView)) {
+    conversationDrafts[conversationView] = input.value;
+  }
   if (voiceState.listening) await window.liora.setDictation(false).then(updateVoiceStatus);
   stopRecordingTimer();
   sessionId = null;
@@ -401,7 +421,8 @@ function latestAssistantMessage(messages) {
     || '今天有什么值得留下的理解？';
 }
 
-function applyReflection(payload) {
+function applyReflection(payload, view = conversationView) {
+  conversationView = payload?.session?.session_type === 'review' ? 'review' : view;
   sessionId = payload.session.id;
   updateProvider(payload);
   if (payload.awaiting_confirmation && payload.knowledge_draft) {
@@ -413,14 +434,23 @@ function applyReflection(payload) {
     setState('thinking');
     return;
   }
-  setView('reflection');
-  showMessage(latestAssistantMessage(payload.messages));
+  setView(conversationView);
+  showMessage(
+    latestAssistantMessage(payload.messages),
+    conversationView === 'review' ? 'LIORA · 回顾' : 'LIORA · 反思'
+  );
   setState('asking');
   input.focus();
 }
 
 async function openReflection(forceNew = false, knowledgeId = null) {
   if (busy) return;
+  sessionId = null;
+  conversationView = 'reflection';
+  input.value = conversationDrafts.reflection;
+  input.placeholder = '写下今天值得留下的理解…';
+  finishButton.textContent = '生成知识文件';
+  resizeInput();
   await openShell('reflection');
   setBusy(true);
   setState('thinking');
@@ -441,6 +471,7 @@ async function sendReflection(content) {
   setBusy(true);
   showError();
   input.value = '';
+  conversationDrafts[conversationView] = '';
   resizeInput();
   showMessage('正在理解你刚才的表达…');
   setState('thinking');
@@ -448,6 +479,7 @@ async function sendReflection(content) {
     applyReflection(await window.liora.sendReflection(sessionId, value));
   } catch (error) {
     input.value = value;
+    conversationDrafts[conversationView] = value;
     resizeInput();
     showError(error.message || '这段内容没有保存成功，请再试一次。');
     showMessage('我还在听，你可以重新发送这一段。');
@@ -467,7 +499,7 @@ async function finishReflection() {
     applyReflection(await window.liora.finishReflection(sessionId));
   } catch (error) {
     showError(error.message || '暂时无法整理这次反思。');
-    setView('reflection');
+    setView(conversationView);
     setState('asking');
   } finally {
     setBusy(false);
@@ -480,11 +512,100 @@ async function confirmKnowledge() {
   try {
     const payload = await window.liora.confirmReflection(sessionId);
     knowledgeBadge.hidden = false;
-    showMessage(`“${payload.knowledge.title}”已经存进你的知识记录。`);
+    showMessage(payload.review_required
+      ? `“${payload.knowledge.title}”有一点拿不准，Liora已经放进 Obsidian 管理台等你确认。`
+      : `“${payload.knowledge.title}”已经存进你的知识记录。`);
     setState('happy');
-    window.setTimeout(() => void closeInteraction(), 1500);
+    if (payload.session?.prompt_id) {
+      independentRecallInput.checked = false;
+      showMessage('Liora收好啦。刚才这次复述，你觉得讲得怎么样？');
+      setView('rating');
+    } else {
+      window.setTimeout(() => void closeInteraction(), 1500);
+    }
   } catch (error) {
     showError(error.message || '这条知识暂时没有保存成功。');
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function openReview(expectedSessionId = null) {
+  if (busy) return;
+  sessionId = null;
+  reviewBadge.hidden = true;
+  conversationView = 'review';
+  input.value = conversationDrafts.review;
+  input.placeholder = '不看笔记，讲给 Liora 听…';
+  finishButton.textContent = '整理这次回顾';
+  resizeInput();
+  await openShell('review');
+  setBusy(true);
+  setState('thinking');
+  showMessage('Liora正在翻找最值得回顾的小问题…', 'LIORA · 回顾');
+  try {
+    const payload = await window.liora.startReview();
+    if (payload.available === false) {
+      sessionId = null;
+      setView('review-empty');
+      showMessage(payload.message || 'Liora暂时没有找到该回顾的小问题。', 'LIORA · 回顾');
+      setState('happy');
+      return;
+    }
+    const consumed = window.LioraReviewOpenState.consumeReviewTask(
+      expectedSessionId,
+      payload.session?.id
+    );
+    if (!consumed.accepted) {
+      reviewBadge.hidden = false;
+      pendingReviewSessionId = consumed.pendingSessionId;
+      throw new Error('Liora收到的回顾任务发生了变化，请再点一次“回顾”。');
+    }
+    pendingReviewSessionId = consumed.pendingSessionId;
+    applyReflection(payload, 'review');
+  } catch (error) {
+    sessionId = null;
+    setView('review-empty');
+    showError(error.message || 'Liora暂时没能打开回顾。');
+    setState('sleepy');
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function deferReview() {
+  if (!sessionId || busy || conversationView !== 'review') return;
+  setBusy(true);
+  showError();
+  try {
+    await window.liora.deferReview(sessionId, 3);
+    sessionId = null;
+    showMessage('Liora先把这个小问题放回三天后。', 'LIORA · 回顾');
+    setView('review-empty');
+    setState('happy');
+  } catch (error) {
+    showError(error.message || 'Liora暂时没能把它放一放。');
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function rateReflection(rating) {
+  if (!sessionId || busy) return;
+  setBusy(true);
+  showError();
+  try {
+    const independentRecall = independentRecallInput.checked;
+    const payload = await window.liora.rateReflection(sessionId, rating, independentRecall);
+    const next = new Date(payload.knowledge_state.next_entry_at);
+    const nextText = Number.isNaN(next.getTime())
+      ? '合适的时候'
+      : new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(next);
+    showMessage(`Liora记住这次手感啦，大约在${nextText}再来找你。`);
+    setState('happy');
+    window.setTimeout(() => void closeInteraction(), 1800);
+  } catch (error) {
+    showError(error.message || 'Liora暂时没记住这次手感，请再点一次。');
   } finally {
     setBusy(false);
   }
@@ -493,7 +614,7 @@ async function confirmKnowledge() {
 function continueReflection() {
   discardConfirming = false;
   pendingKnowledgeDraft = null;
-  setView('reflection');
+  setView(conversationView);
   showMessage('你可以继续聊。我会用新的理解重新构建知识文件。');
   setState('asking');
   input.focus();
@@ -876,18 +997,19 @@ function updateVoiceStatus(status) {
   const transcribing = voiceState.stage === 'transcribing';
   if (voiceState.listening && !transcribing) startRecordingTimer();
   if (!voiceState.listening || transcribing) stopRecordingTimer();
-  recordingState.hidden = activeView !== 'reflection' || !voiceState.listening || transcribing;
+  const inConversation = ['reflection', 'review'].includes(activeView);
+  recordingState.hidden = !inConversation || !voiceState.listening || transcribing;
   microphoneButton.classList.toggle('is-listening', voiceState.listening && !transcribing);
   microphoneLabel.textContent = transcribing
     ? '正在转写'
     : voiceState.listening ? '说完了' : '开始说';
   microphoneButton.disabled = busy || !voiceState.available || transcribing;
   finishButton.disabled = busy || voiceState.listening;
-  if (transcribing && activeView === 'reflection') {
+  if (transcribing && inConversation) {
     showMessage('正在听清并整理你刚才说的话…');
     setState('thinking');
   }
-  if (status.error && activeView === 'reflection') showError(status.error);
+  if (status.error && inConversation) showError(status.error);
 }
 
 function resizeInput() {
@@ -940,6 +1062,7 @@ character.addEventListener('keydown', (event) => {
 
 featureButtons.forEach((button) => button.addEventListener('click', () => {
   if (button.dataset.feature === 'reflection') void openReflection();
+  if (button.dataset.feature === 'review') void openReview(pendingReviewSessionId);
   if (button.dataset.feature === 'knowledge') void openKnowledge();
   if (button.dataset.feature === 'weather') void openWeather();
 }));
@@ -949,6 +1072,11 @@ composer.addEventListener('submit', (event) => {
   void sendReflection(input.value);
 });
 input.addEventListener('input', resizeInput);
+input.addEventListener('input', () => {
+  if (['reflection', 'review'].includes(conversationView)) {
+    conversationDrafts[conversationView] = input.value;
+  }
+});
 input.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
@@ -961,7 +1089,12 @@ microphoneButton.addEventListener('click', async () => {
   updateVoiceStatus(await window.liora.setDictation(!voiceState.listening));
 });
 finishButton.addEventListener('click', finishReflection);
+deferReviewButton.addEventListener('click', deferReview);
+deferReviewDraftButton.addEventListener('click', deferReview);
 confirmKnowledgeButton.addEventListener('click', confirmKnowledge);
+ratingButtons.forEach((button) => button.addEventListener('click', () => {
+  void rateReflection(button.dataset.reflectionRating);
+}));
 continueReflectionButton.addEventListener('click', continueReflection);
 editKnowledgeButton.addEventListener('click', openDraftEditor);
 saveDraftButton.addEventListener('click', saveDraft);
@@ -1008,13 +1141,24 @@ document.addEventListener('contextmenu', (event) => {
 
 window.liora.onEnter(enter);
 window.liora.onOpenReflection(() => void openReflection());
+window.liora.onOpenReview((event) => {
+  const next = window.LioraReviewOpenState.receiveReviewTask({
+    activeView,
+    busy,
+    pendingSessionId: pendingReviewSessionId,
+    eventSessionId: event?.session_id
+  });
+  pendingReviewSessionId = next.pendingSessionId;
+  reviewBadge.hidden = false;
+  if (next.shouldOpen) void openReview(pendingReviewSessionId);
+});
 window.liora.onVoiceStatus(updateVoiceStatus);
 window.liora.onVoiceWake(() => {
   const generation = ++voicePromptGeneration;
   setState('asking');
   void openShell('voice').then(() => {
     if (generation === voicePromptGeneration && activeView === 'voice') {
-      showMessage('我在听。自然地告诉我你想聊聊、查看知识，还是问天气。');
+      showMessage('我在听。自然地告诉我你想反思、回顾、查看知识，还是问天气。');
     }
   });
 });
@@ -1029,6 +1173,7 @@ window.liora.onVoiceCommand(async (event) => {
   voiceNavigationBusy = true;
   try {
     if (event?.intent === 'reflection') await openReflection();
+    if (event?.intent === 'review') await openReview();
     if (event?.intent === 'knowledge') await openKnowledge();
     if (event?.intent === 'weather') await openWeather();
   } finally {
@@ -1046,7 +1191,7 @@ window.liora.onVoiceClarify((event) => {
 });
 window.liora.onVoiceTranscript((event) => {
   showError();
-  if (activeView !== 'reflection' || !event.text) return;
+  if (!['reflection', 'review'].includes(activeView) || !event.text) return;
   input.value = window.LioraVoiceDraft.mergeVoiceTranscript(input.value, event.text);
   resizeInput();
   input.focus();
