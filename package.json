@@ -1,7 +1,7 @@
 {
   "name": "liora-desktop-companion",
   "version": "0.2.4",
-  "description": "A privacy-first desktop AI companion that turns daily reflections into a growing personal knowledge base.",
+  "description": "A local-first personal knowledge steward that turns reflection into structured memory and maintains an evidence-backed Obsidian knowledge base.",
   "main": "src/main.js",
   "scripts": {
     "start": "node scripts/start.js",
