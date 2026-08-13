@@ -12,8 +12,13 @@ from database import ReflectionDatabase, utc_now
 
 
 IGNORED_DIRECTORIES = {".git", ".obsidian", ".trash", "node_modules", "templates"}
+# Accept the canonical marker and historical/malformed variants such as
+# ``<!-- loria:begin -->`` and ``<!loria-begin->``. Marker spelling is
+# metadata, never knowledge content.
 LIORA_BLOCK_PATTERN = re.compile(
-    r"<!--\s*liora:begin\s*-->(.*?)<!--\s*liora:end\s*-->",
+    r"<!(?:--)?\s*(?:liora|loria)\s*[:_-]?\s*begin\s*(?:--|-)?\s*>"
+    r"(.*?)"
+    r"<!(?:--)?\s*(?:liora|loria)\s*[:_-]?\s*end\s*(?:--|-)?\s*>",
     re.IGNORECASE | re.DOTALL,
 )
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -184,6 +189,12 @@ def parse_markdown(text: str, fallback_title: str) -> dict:
         managed_title = heading_title.removeprefix("Liora 整理：").strip()
     title = str(managed_title or metadata.get("title") or heading_title or fallback_title).strip()
     tags = _knowledge_tags(metadata, body)
+    declared_type = str(metadata.get("type") or "").strip().casefold()
+    declared_source = str(metadata.get("source") or "obsidian").strip() or "obsidian"
+    # Every Markdown file inside the dedicated Liora Vault is a knowledge
+    # object. Frontmatter describes the kind/source of knowledge; it is not an
+    # admission check for whether the file belongs in the knowledge engine.
+    object_type = declared_type or "knowledge"
     core_lines = _clean_lines(find_section(aliases["core_insight"]))
     if not core_lines:
         generic = []
@@ -199,7 +210,8 @@ def parse_markdown(text: str, fallback_title: str) -> dict:
         "created_at": str(metadata.get("created") or "").strip(),
         "updated_at": str(metadata.get("liora_updated") or metadata.get("updated") or "").strip(),
         "version": metadata.get("liora_version") or metadata.get("version") or 1,
-        "source": str(metadata.get("source") or "obsidian").strip() or "obsidian",
+        "source": declared_source,
+        "object_type": object_type,
         "tags": tags,
         "search_text": "\n".join((title, body)).strip(),
         "content": {
@@ -367,6 +379,21 @@ class KnowledgeVault:
         self._relative(candidate)
         return candidate
 
+    def read_markdown(self, relative_path: str) -> str:
+        path = self._path(relative_path)
+        return path.read_text(encoding="utf-8-sig") if path.exists() else ""
+
+    def restore_markdown(self, relative_path: str, text: str) -> None:
+        path = self._path(relative_path)
+        self._atomic_write(path, text)
+        self.scan(force=True)
+
+    def delete_created(self, relative_path: str) -> None:
+        path = self._path(relative_path)
+        if path.exists():
+            path.unlink()
+        self.scan(force=True)
+
     def _markdown_files(self) -> list[Path]:
         files = []
         for path in self.vault_path.rglob("*.md"):
@@ -440,6 +467,7 @@ class KnowledgeVault:
                     "file_size": stat.st_size,
                     "content_hash": content_hash,
                     "source": parsed["source"],
+                    "object_type": parsed["object_type"],
                     "indexed_at": now,
                     "folder": Path(relative).parent.as_posix()
                     if Path(relative).parent.as_posix() != "."
@@ -520,6 +548,7 @@ class KnowledgeVault:
             "file_size": stat.st_size,
             "content_hash": _file_hash(data),
             "source": "liora" if not existing or existing.get("source") == "liora" else existing["source"],
+            "object_type": parsed["object_type"],
             "indexed_at": utc_now(),
             "folder": Path(self._relative(path)).parent.as_posix()
             if Path(self._relative(path)).parent.as_posix() != "."

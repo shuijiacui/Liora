@@ -17,6 +17,7 @@ for package in (
     "opencc",
     "sounddevice",
     "tokenizers",
+    "onnxruntime",
     "vosk",
     "_sounddevice_data",
 ):

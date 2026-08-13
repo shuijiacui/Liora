@@ -22,6 +22,9 @@
 
       <nav id="feature-rail" class="feature-rail" aria-label="Liora 功能" aria-hidden="true">
         <button class="feature-bubble" type="button" data-feature="reflection">反思</button>
+        <button class="feature-bubble" type="button" data-feature="review">
+          回顾<span id="review-badge" class="feature-bubble__badge" hidden>1</span>
+        </button>
         <button class="feature-bubble" type="button" data-feature="knowledge">
           知识<span id="knowledge-badge" class="feature-bubble__badge" hidden>+1</span>
         </button>
@@ -120,7 +123,7 @@
             rows="1"
             maxlength="2000"
             placeholder="写下你的想法……"
-            aria-label="反思内容"
+            aria-label="告诉 Liora 你的想法"
           ></textarea>
           <button id="send-button" class="round-action round-action--primary" type="submit" aria-label="发送">↑</button>
         </form>
@@ -131,6 +134,7 @@
             <span id="microphone-label">开始说</span>
           </button>
           <button id="finish-button" class="bubble-action bubble-action--quiet" type="button">生成知识文件</button>
+          <button id="defer-review" class="bubble-action bubble-action--quiet" type="button" hidden>先放一放</button>
         </footer>
 
         <footer id="confirmation-actions" class="bubble-actions bubble-actions--wrap" hidden>
@@ -138,6 +142,20 @@
           <button id="edit-knowledge" class="bubble-action" type="button">编辑与修改</button>
           <button id="continue-reflection" class="bubble-action bubble-action--quiet" type="button">继续聊聊</button>
           <button id="discard-knowledge" class="bubble-action bubble-action--quiet" type="button">这次不保存</button>
+          <button id="defer-review-draft" class="bubble-action bubble-action--quiet" type="button" hidden>回顾先放一放</button>
+        </footer>
+
+        <footer id="rating-actions" class="reflection-rating" hidden>
+          <label class="reflection-rating__recall">
+            <input id="independent-recall" type="checkbox" />
+            <span>这次完全没看笔记</span>
+          </label>
+          <div class="bubble-actions bubble-actions--wrap">
+            <button class="bubble-action" data-reflection-rating="again" type="button">还没讲清</button>
+            <button class="bubble-action" data-reflection-rating="hard" type="button">有点费劲</button>
+            <button class="bubble-action bubble-action--primary" data-reflection-rating="good" type="button">基本讲清</button>
+            <button class="bubble-action" data-reflection-rating="easy" type="button">很轻松</button>
+          </div>
         </footer>
 
         <footer id="draft-editor-actions" class="bubble-actions bubble-actions--wrap" hidden>
@@ -183,6 +201,7 @@
     <script src="./shared/location-name.js"></script>
     <script src="./shared/voice-draft.js"></script>
     <script src="./shared/knowledge-query.js"></script>
+    <script src="./shared/review-open-state.js"></script>
     <script src="./renderer.js"></script>
   </body>
 </html>

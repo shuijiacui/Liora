@@ -61,6 +61,31 @@ class KnowledgeVaultTests(unittest.TestCase):
         self.assertIn("## 延伸理解", markdown)
         self.assertEqual(parsed["content"]["extensions"], content["extensions"])
         self.assertEqual(parsed["content"]["sources"], content["sources"])
+        self.assertEqual(parsed["object_type"], "knowledge")
+
+    def test_malformed_historical_liora_markers_are_metadata_not_content(self) -> None:
+        parsed = parse_markdown(
+            "# 手写标题\n\n<!loria-begin->\n# Liora 整理：真正标题\n\n## 核心理解\n\n真正的知识内容。\n<!loria-end->\n",
+            "fallback",
+        )
+        self.assertEqual(parsed["title"], "真正标题")
+        self.assertEqual(parsed["content"]["core_insight"], "真正的知识内容。")
+        self.assertNotIn("loria", parsed["content"]["core_insight"].casefold())
+
+    def test_every_markdown_is_a_knowledge_object_without_requiring_markers(self) -> None:
+        ordinary = parse_markdown("# 普通笔记\n\n只是随手记录。", "fallback")
+        explicit = parse_markdown(
+            "---\ntype: concept\n---\n# 注意力\n\n## 尚待探索\n\n- 为什么需要缩放？\n",
+            "fallback",
+        )
+        managed = parse_markdown(
+            "# 外部笔记\n\n<!-- liora:begin -->\n## 核心理解\n\n由 Liora 管理。\n<!-- liora:end -->\n",
+            "fallback",
+        )
+
+        self.assertEqual(ordinary["object_type"], "knowledge")
+        self.assertEqual(explicit["object_type"], "concept")
+        self.assertEqual(managed["object_type"], "knowledge")
 
     def test_scan_is_read_only_incremental_and_tracks_a_rename(self) -> None:
         note = self.vault_path / "Notes" / "Attention.md"
@@ -218,6 +243,38 @@ class KnowledgeVaultTests(unittest.TestCase):
         unusual = service.knowledge_list(query='" OR *', limit=10)
         self.assertEqual(unusual["total"], 0)
 
+    def test_dashboard_counts_every_markdown_and_collects_questions(self) -> None:
+        (self.vault_path / "普通笔记.md").write_text("# 普通笔记\n\n也应计入 Dashboard。\n", encoding="utf-8")
+        (self.vault_path / "注意力.md").write_text(
+            "---\nid: KO-ATTENTION\ntype: concept\ntitle: 注意力机制\n---\n"
+            "# 注意力机制\n\n## 核心理解\n\n根据输入动态计算权重。\n\n"
+            "## 尚待探索\n\n- 为什么要除以根号 dk？\n",
+            encoding="utf-8",
+        )
+        service = ReflectionService(
+            self.database,
+            vault_path=self.vault_path,
+            data_dir=Path(self.temporary.name) / "data",
+        )
+
+        dashboard = service.dashboard()
+
+        self.assertEqual(dashboard["knowledge_count"], 2)
+        self.assertNotIn("unclassified_count", dashboard)
+        self.assertEqual(dashboard["open_question_count"], 1)
+        self.assertEqual(
+            {item["title"] for item in dashboard["recent"]},
+            {"普通笔记", "注意力机制"},
+        )
+        self.assertEqual(dashboard["open_questions"][0]["question"], "为什么要除以根号 dk？")
+
+        prompts = service.reflection_prompts()
+        self.assertEqual(prompts["total"], 1)
+        self.assertEqual(prompts["items"][0]["kind"], "knowledge_gap")
+        self.assertEqual(prompts["items"][0]["prompt"], "为什么要除以根号 dk？")
+        self.assertEqual(prompts["items"][0]["reason_code"], "open_question")
+        self.assertIn("Liora没有额外猜测", prompts["items"][0]["reason"])
+
     def test_existing_document_index_schema_is_upgraded_without_data_loss(self) -> None:
         root = Path(self.temporary.name)
         database_path = root / "legacy.sqlite3"
@@ -275,6 +332,7 @@ class KnowledgeVaultTests(unittest.TestCase):
         try:
             item = upgraded.list_knowledge_documents()[0]
             self.assertEqual(item["title"], "旧索引")
+            self.assertEqual(item["object_type"], "knowledge")
             self.assertFalse(item["search_indexed"])
             upgraded.upsert_knowledge_document(
                 {

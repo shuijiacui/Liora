@@ -124,6 +124,66 @@ class DeepSeekClientTests(unittest.TestCase):
         body = json.loads(mocked_urlopen.call_args.args[0].data.decode("utf-8"))
         self.assertIn("增加一个例子", body["messages"][-1]["content"])
 
+    def test_alignment_judge_is_constrained_to_retrieved_candidates(self) -> None:
+        settings = DeepSeekSettings(
+            api_key="test-secret",
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-flash",
+            timeout_seconds=5,
+        )
+        client = DeepSeekClient(settings)
+        response = FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "decision": "UPDATE",
+                                    "target_id": "bfs",
+                                    "relationship": "same mechanism",
+                                    "conflicts": [],
+                                    "reason": "两者解释同一个 BFS 层序扩展机制。",
+                                    "confidence": 0.86,
+                                    "needs_human_review": True,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    }
+                ]
+            }
+        )
+        with patch("deepseek_client.urlopen", return_value=response):
+            result = client.judge_alignment(
+                {"title": "BFS 的层序扩展", "core_insight": "使用队列逐层访问。"},
+                [{"knowledge_id": "bfs", "title": "广度优先搜索", "score": 0.54}],
+            )
+        self.assertEqual(result["decision"], "UPDATE")
+        self.assertEqual(result["target_id"], "bfs")
+
+        invalid = FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {"decision": "UPDATE", "target_id": "invented"}
+                            ),
+                        }
+                    }
+                ]
+            }
+        )
+        with patch("deepseek_client.urlopen", return_value=invalid):
+            with self.assertRaises(Exception):
+                client.judge_alignment(
+                    {"title": "BFS"},
+                    [{"knowledge_id": "bfs", "title": "广度优先搜索", "score": 0.54}],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

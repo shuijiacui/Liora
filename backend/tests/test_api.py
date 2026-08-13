@@ -13,7 +13,12 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
 from database import ReflectionDatabase
-from main import ReflectionHandler, ThreadingHTTPServer, format_voice_event
+from main import (
+    ReflectionHandler,
+    ThreadingHTTPServer,
+    format_reflection_event,
+    format_voice_event,
+)
 from service import ReflectionService
 
 
@@ -25,6 +30,8 @@ class ReflectionApiTests(unittest.TestCase):
         self.server.service = ReflectionService(self.database)
         self.server.voice_transcriber = None
         self.server.api_token = "test-token"
+        self.reflection_events = []
+        self.server.reflection_event_callback = self.reflection_events.append
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
@@ -85,6 +92,44 @@ class ReflectionApiTests(unittest.TestCase):
             self.request("/health", token="wrong-token")
         self.assertEqual(context.exception.code, 401)
 
+    def test_dashboard_endpoint_returns_knowledge_summary(self) -> None:
+        started = self.request("/api/reflections/start", {"force_new": True})
+        session_id = started["session"]["id"]
+        self.request(
+            f"/api/reflections/{session_id}/messages",
+            {"content": "检索练习会强化记忆。"},
+        )
+        self.request(f"/api/reflections/{session_id}/finish", {})
+        self.request(f"/api/reflections/{session_id}/confirm", {})
+
+        dashboard = self.request("/api/dashboard")
+
+        self.assertEqual(dashboard["knowledge_count"], 1)
+        self.assertEqual(len(dashboard["recent"]), 1)
+        self.assertEqual(dashboard["health"], {"growing": 1, "stable": 0, "due": 1})
+
+    def test_reflection_prompts_endpoint_uses_real_open_questions(self) -> None:
+        started = self.request("/api/reflections/start", {"force_new": True})
+        session_id = started["session"]["id"]
+        self.request(
+            f"/api/reflections/{session_id}/messages",
+            {"content": "注意力会动态聚合信息，但我还不理解为什么需要缩放。"},
+        )
+        draft = self.request(f"/api/reflections/{session_id}/finish", {})
+        edited = {
+            **draft["knowledge_draft"],
+            "title": "注意力机制",
+            "open_questions": ["为什么点积结果需要缩放？"],
+        }
+        self.request(f"/api/reflections/{session_id}/draft", {"content": edited})
+        self.request(f"/api/reflections/{session_id}/confirm", {})
+
+        prompts = self.request("/api/reflection-prompts?limit=8")
+
+        self.assertEqual(prompts["total"], 1)
+        self.assertEqual(prompts["items"][0]["prompt"], "为什么点积结果需要缩放？")
+        self.assertEqual(prompts["items"][0]["reason_code"], "open_question")
+
     def test_discard_endpoint_removes_the_draft_without_creating_knowledge(self) -> None:
         started = self.request("/api/reflections/start", {"force_new": True})
         session_id = started["session"]["id"]
@@ -104,6 +149,54 @@ class ReflectionApiTests(unittest.TestCase):
         line.encode("ascii")
         payload = json.loads(line.removeprefix("LIORA_VOICE_EVENT "))
         self.assertEqual(payload["text"], "今天学习了注意力机制")
+
+    def test_obsidian_prompt_starts_pet_session_then_accepts_rating(self) -> None:
+        started = self.request("/api/reflections/start", {"force_new": True})
+        session_id = started["session"]["id"]
+        self.request(f"/api/reflections/{session_id}/messages", {"content": "检索练习强化记忆。"})
+        draft = self.request(f"/api/reflections/{session_id}/finish", {})
+        draft["knowledge_draft"]["open_questions"] = ["为什么主动提取更有效？"]
+        self.request(f"/api/reflections/{session_id}/draft", {"content": draft["knowledge_draft"]})
+        self.request(f"/api/reflections/{session_id}/confirm", {})
+        prompt = self.request("/api/reflection-prompts?limit=8")["items"][0]
+
+        task = self.request(f"/api/reflection-prompts/{prompt['id']}/start", {})
+        task_id = task["session"]["id"]
+        self.assertEqual(task["messages"][0]["content"], prompt["prompt"])
+        self.assertEqual(self.reflection_events[0]["type"], "review-task-started")
+        self.assertEqual(self.reflection_events[0]["session_id"], task_id)
+
+        self.request(f"/api/reflections/{task_id}/messages", {"content": "因为提取本身会强化路径。"})
+        self.request(f"/api/reflections/{task_id}/finish", {})
+        self.request(f"/api/reflections/{task_id}/confirm", {})
+        rated = self.request(
+            f"/api/reflections/{task_id}/rate",
+            {"rating": "easy", "independent_recall": True},
+        )
+        self.assertEqual(rated["knowledge_state"]["stability_days"], 7.0)
+        self.assertTrue(rated["event"]["independent_recall"])
+
+    def test_review_start_endpoint_returns_a_friendly_empty_state(self) -> None:
+        result = self.request("/api/reviews/start", {})
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["reason"], "no_due_prompt")
+
+    def test_reflection_event_pipe_is_ascii_and_round_trips_chinese(self) -> None:
+        line = format_reflection_event({"type": "review-task-started", "title": "注意力机制"})
+        line.encode("ascii")
+        payload = json.loads(line.removeprefix("LIORA_REFLECTION_EVENT "))
+        self.assertEqual(payload["title"], "注意力机制")
+
+    def test_intelligence_endpoints_return_structured_empty_results(self) -> None:
+        self.assertEqual(self.request("/api/changesets?status=pending")["items"], [])
+        self.assertEqual(self.request("/api/relations")["items"], [])
+        granularity = self.request("/api/granularity")
+        self.assertEqual(granularity["items"], [])
+        self.assertEqual(granularity["hierarchy"], [])
+        answer = self.request("/api/knowledge/ask", {"question": "当前知识库里有什么？"})
+        self.assertEqual(answer["provider"], "local")
+        self.assertEqual(answer["evidence"], [])
 
     def test_command_audio_is_transcribed_in_memory(self) -> None:
         calls = []
