@@ -12,3 +12,9 @@ test("extracts clean Markdown passages and pairs the most related content", () =
   assert.match(evidence.sourceExcerpt, /队列|BFS/u);
   assert.match(evidence.targetExcerpt, /队列|BFS/u);
 });
+
+test("never exposes Liora markers or template headings as relation evidence", () => {
+  const passages = markdownPassages("<!-- liora:begin -->\n\n## 核心理解\n\n真正的知识正文。\n\n## 尚待探索\n\n待补充\n\n<!-- liora:end -->");
+  assert.deepEqual(passages, ["真正的知识正文。"]);
+  assert.ok(passages.every((value) => !/liora|核心理解|尚待探索/iu.test(value)));
+});

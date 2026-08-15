@@ -2,14 +2,17 @@ import type { DashboardQuestion } from "./dashboard-model";
 
 export interface ReflectionPrompt {
   id: string;
-  kind: "knowledge_gap";
+  kind: "open_question" | "diagnostic" | "transfer_check" | "knowledge_gap";
   knowledgeId: string;
   title: string;
   path: string;
   context: string;
   prompt: string;
-  reasonCode: "open_question";
+  reasonCode: "open_question" | "kc_uncertainty" | "transfer_gap";
   reason: string;
+  targetKcIds?: string[];
+  rubric?: Record<string, unknown>;
+  learnerState?: { label?: string; mastery?: number; uncertainty?: number; transfer_level?: number };
 }
 
 export interface QuestionVoice {
@@ -54,17 +57,24 @@ export function normalizeReflectionPrompts(payload: unknown): ReflectionPrompt[]
     const id = clean(item.id, 120);
     const prompt = clean(item.prompt);
     const title = clean(item.title, 160) || "未命名知识";
-    if (!id || !prompt || item.kind !== "knowledge_gap" || item.reason_code !== "open_question") return [];
+    const kind = clean(item.kind, 40);
+    const reasonCode = clean(item.reason_code, 40);
+    if (!id || !prompt || !["open_question", "diagnostic", "transfer_check", "knowledge_gap"].includes(kind)) return [];
+    if (!["open_question", "kc_uncertainty", "transfer_gap"].includes(reasonCode)) return [];
     return [{
       id,
-      kind: "knowledge_gap",
+      kind: kind as ReflectionPrompt["kind"],
       knowledgeId: clean(item.knowledge_id, 120),
       title,
       path: clean(item.path),
       context: clean(item.context, 240),
       prompt,
-      reasonCode: "open_question",
-      reason: clean(item.reason, 500) || `这个问题来自《${title}》的“尚待探索”。`
+      reasonCode: reasonCode as ReflectionPrompt["reasonCode"],
+      reason: clean(item.reason, 500) || `这个问题来自《${title}》的“尚待探索”。`,
+      targetKcIds: Array.isArray(item.target_kc_ids) ? item.target_kc_ids.map(String) : [],
+      rubric: item.rubric && typeof item.rubric === "object" ? item.rubric as Record<string, unknown> : {},
+      learnerState: item.learner_state && typeof item.learner_state === "object"
+        ? item.learner_state as ReflectionPrompt["learnerState"] : undefined
     }];
   });
 }
@@ -74,7 +84,7 @@ export function promptsFromDashboardQuestions(questions: DashboardQuestion[]): R
     id: item.knowledgeId
       ? `vault:${item.knowledgeId}:${index}:${item.question}`
       : `vault:${item.path}:${index}:${item.question}`,
-    kind: "knowledge_gap",
+    kind: "open_question",
     knowledgeId: item.knowledgeId,
     title: item.title,
     path: item.path,

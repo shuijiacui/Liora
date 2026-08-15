@@ -1,7 +1,7 @@
 {
   "id": "liora-knowledge",
   "name": "Liora Knowledge",
-  "version": "0.6.0",
+  "version": "0.8.0",
   "minAppVersion": "1.5.0",
   "description": "A Liora knowledge home and active-recall bridge for Obsidian.",
   "author": "Liora",

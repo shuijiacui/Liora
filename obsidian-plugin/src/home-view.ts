@@ -228,7 +228,12 @@ export class LioraHomeView extends ItemView {
     const safeIndex = ((this.promptIndex % prompts.length) + prompts.length) % prompts.length;
     const prompt = prompts[safeIndex];
     const voice = voiceFor(prompt.id, this.promptVariation);
-    area.createDiv({ cls: "liora-reflection__kicker", text: voice.eyebrow });
+    const promptVoice = prompt.kind === "diagnostic"
+      ? { eyebrow: "Liora 想确认一小块掌握情况", primaryAction: "开始 3 分钟诊断" }
+      : prompt.kind === "transfer_check"
+        ? { eyebrow: "Liora 想看看这项知识能否迁移", primaryAction: "开始迁移检验" }
+        : voice;
+    area.createDiv({ cls: "liora-reflection__kicker", text: promptVoice.eyebrow });
     area.createDiv({ cls: "liora-reflection__topic", text: prompt.title });
     area.createEl("p", { cls: "liora-reflection__question", text: prompt.prompt });
     if (this.reasonVisible) {
@@ -237,7 +242,7 @@ export class LioraHomeView extends ItemView {
       reason.createSpan({ text: prompt.reason });
     }
     const actions = area.createDiv({ cls: "liora-reflection__actions" });
-    const primary = actions.createEl("button", { cls: "liora-button-primary", text: "开始 3 分钟回顾" });
+    const primary = actions.createEl("button", { cls: "liora-button-primary", text: promptVoice.primaryAction });
     primary.addEventListener("click", async () => {
       primary.disabled = true;
       const result = await this.plugin.createKnowledgeService().startReflectionPrompt(prompt.id);

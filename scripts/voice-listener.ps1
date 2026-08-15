@@ -77,7 +77,7 @@ try {
             $engine.LoadGrammar($wakeGrammar)
         }
 
-        # Dictation is handled by faster-whisper in the app. Keep this legacy
+        # Dictation is handled by SenseVoice in the app. Keep this legacy
         # mode on one engine only so multiple language engines do not duplicate it.
         if (($Mode -eq 'Dictation' -or $Mode -eq 'Both') -and $index -eq 0) {
             $dictation = [System.Speech.Recognition.DictationGrammar]::new()

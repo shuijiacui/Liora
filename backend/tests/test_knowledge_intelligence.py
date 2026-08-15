@@ -2,6 +2,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -10,8 +11,10 @@ sys.path.insert(0, str(BACKEND_DIR))
 from database import ReflectionDatabase
 from knowledge_intelligence import (
     align_knowledge,
+    build_knowledge_chunks,
     content_diff,
     discover_relations,
+    extract_cognitive_profile,
     granularity_candidates,
     semantic_candidates,
     semantic_clean,
@@ -98,6 +101,71 @@ class KnowledgeIntelligenceUnitTests(unittest.TestCase):
         ])
         self.assertEqual(relations, [])
 
+    def test_canonical_chunks_never_contain_liora_scaffolding(self) -> None:
+        value = content(
+            "递归",
+            "<!-- liora:begin -->\n## 核心理解\n递归把问题分解为更小的子问题。\n<!-- liora:end -->",
+        )
+        chunks = build_knowledge_chunks(value, "recursion")
+        self.assertTrue(chunks)
+        self.assertTrue(all("liora" not in item["text"].casefold() for item in chunks))
+        self.assertTrue(all("核心理解" not in item["text"] for item in chunks))
+
+    def test_whole_document_dense_similarity_cannot_bypass_chunk_evidence(self) -> None:
+        documents = [
+            {
+                "id": "coffee", "title": "咖啡", "content": content("咖啡", "浅烘焙突出果酸。"),
+                "embedding": [1.0, 0.0],
+                "chunks": [{"id": "coffee-1", "text": "浅烘焙突出果酸。", "section": "core_insight", "embedding": [1.0, 0.0]}],
+                "cognitive_profile": {"patterns": []},
+            },
+            {
+                "id": "law", "title": "民法", "content": content("民法", "诉讼时效影响请求权保护。"),
+                "embedding": [1.0, 0.0],
+                "chunks": [{"id": "law-1", "text": "诉讼时效影响请求权保护。", "section": "core_insight", "embedding": [0.0, 1.0]}],
+                "cognitive_profile": {"patterns": []},
+            },
+        ]
+        self.assertEqual(discover_relations(documents, semantic_model=True), [])
+
+    def test_shared_reasoning_pattern_creates_separate_cognitive_relation(self) -> None:
+        planning = content("项目规划", "把大型项目分解为可独立推进的工作单元。")
+        merge_sort = content("归并排序", "把数组分解为子数组，分别处理后再合并。")
+        documents = [
+            {"id": "planning", "title": "项目规划", "content": planning, "cognitive_profile": extract_cognitive_profile(planning)},
+            {"id": "merge", "title": "归并排序", "content": merge_sort, "cognitive_profile": extract_cognitive_profile(merge_sort)},
+        ]
+        relations = discover_relations(documents)
+        cognitive = next(item for item in relations if item["category"] == "cognitive")
+        self.assertEqual(cognitive["evidence"]["pattern_id"], "decomposition")
+        self.assertIn("分解", cognitive["evidence"]["source_excerpt"])
+        self.assertIn("分解", cognitive["evidence"]["target_excerpt"])
+
+    def test_relation_storage_round_trips_evidence_and_compact_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = ReflectionDatabase(Path(directory) / "liora.sqlite3")
+            try:
+                relation = {
+                    "source_id": "a", "target_id": "b", "kind": "cognitive",
+                    "category": "cognitive", "label": "shares_reasoning_pattern:abstraction",
+                    "confidence": 0.81, "reason": "共同使用抽象。", "status": "candidate",
+                    "evidence": {"source_excerpt": "忽略细节建立模型。", "target_excerpt": "抽象出统一表示。", "basis": "cognitive"},
+                    "features": {"pattern_id": "abstraction"}, "pipeline_version": "knowledge-graph-v3",
+                }
+                database.replace_discovered_relations([relation])
+                stored = database.list_relations("candidate")[0]
+                self.assertEqual(stored["evidence"]["basis"], "cognitive")
+                self.assertEqual(stored["features"]["pattern_id"], "abstraction")
+                database.replace_knowledge_chunks(
+                    [{"id": "chunk", "knowledge_id": "a", "fingerprint": "fp", "section": "core_insight", "ordinal": 0, "text": "正文证据", "embedding": [0.25, -0.5]}],
+                    "test-model",
+                )
+                vector = database.list_knowledge_chunks()["chunk"]["embedding"]
+                self.assertAlmostEqual(vector[0], 0.25, places=3)
+                self.assertAlmostEqual(vector[1], -0.5, places=3)
+            finally:
+                database.close()
+
     def test_refresh_removes_stale_candidates_but_preserves_user_decisions(self) -> None:
         now = "2026-08-13T12:00:00+00:00"
         with tempfile.TemporaryDirectory() as directory:
@@ -124,6 +192,36 @@ class KnowledgeIntelligenceUnitTests(unittest.TestCase):
             finally:
                 database.close()
 
+    def test_refresh_removes_stale_granularity_candidates_but_preserves_user_decisions(self) -> None:
+        now = "2026-08-13T12:00:00+00:00"
+        with tempfile.TemporaryDirectory() as directory:
+            database = ReflectionDatabase(Path(directory) / "liora.sqlite3")
+            try:
+                with database._lock, database._connection:
+                    database._connection.executemany(
+                        """
+                        INSERT INTO granularity_candidates
+                            (id, signature, kind, source_ids_json, score, reasons_json,
+                             proposal_json, status, created_at, updated_at)
+                        VALUES (?, ?, 'split', '["copilot"]', 0.8, '{}', '{}', ?, ?, ?)
+                        """,
+                        [
+                            ("candidate", "candidate", "candidate", now, now),
+                            ("rejected", "rejected", "rejected", now, now),
+                        ],
+                    )
+                database.replace_granularity_candidates([])
+                self.assertEqual(
+                    [item["id"] for item in database.list_granularity_candidates("candidate")],
+                    [],
+                )
+                self.assertEqual(
+                    [item["id"] for item in database.list_granularity_candidates("rejected")],
+                    ["rejected"],
+                )
+            finally:
+                database.close()
+
     def test_diff_and_granularity_are_explainable(self) -> None:
         before = content("Attention", "动态聚合信息。")
         after = {**before, "core_insight": "根据输入关系动态聚合信息。"}
@@ -139,6 +237,9 @@ class KnowledgeIntelligenceUnitTests(unittest.TestCase):
         self.assertTrue(any(item["kind"] == "split" for item in candidates))
         split = next(item for item in candidates if item["kind"] == "split")
         self.assertIn("semantic_separation", split["reasons"])
+        self.assertEqual(split["proposal"]["strategy"], "copy_then_link")
+        self.assertTrue(split["proposal"]["reversible"])
+        self.assertTrue(all(child["source_excerpts"] for child in split["proposal"]["children"]))
 
 
 class KnowledgeChangeSetFlowTests(unittest.TestCase):
@@ -199,6 +300,73 @@ class KnowledgeChangeSetFlowTests(unittest.TestCase):
         self.assertTrue(result["review_required"])
         self.assertEqual(result["changeset"]["status"], "pending")
         self.assertEqual(original_path.read_text(encoding="utf-8"), original)
+
+    def test_confident_independent_create_is_applied_after_adjudication(self) -> None:
+        self.service.confirm(
+            self._draft("BFS", "BFS 使用队列按层遍历图节点。")
+        )
+        session_id = self._draft(
+            "线性结构",
+            "线性结构用有序的前驱和后继关系组织元素。",
+        )
+        adjudicated = {
+            "action": "create",
+            "decision_basis": "deepseek_adjudication",
+            "target_id": None,
+            "target_title": None,
+            "confidence": 0.95,
+            "reason": "与候选只共享领域术语，应创建独立知识。",
+            "candidates": [{"knowledge_id": "bfs", "score": 0.53}],
+            "thresholds": {"related": 0.3},
+            "adjudication": {
+                "decision": "CREATE",
+                "confidence": 0.95,
+                "conflicts": [],
+                "needs_human_review": False,
+            },
+        }
+        with patch.object(
+            self.service,
+            "_judge_ambiguous_alignment",
+            return_value=adjudicated,
+        ):
+            result = self.service.confirm(session_id)
+
+        self.assertFalse(result["review_required"])
+        self.assertEqual(result["changeset"]["status"], "applied")
+        self.assertTrue((self.vault_path / result["knowledge"]["relative_path"]).exists())
+
+    def test_adjudicated_update_still_waits_for_review(self) -> None:
+        alignment = {
+            "action": "update",
+            "decision_basis": "deepseek_adjudication",
+            "target_id": "bfs",
+            "adjudication": {
+                "decision": "UPDATE",
+                "confidence": 0.98,
+                "conflicts": [],
+                "needs_human_review": False,
+            },
+        }
+        self.assertTrue(
+            self.service._alignment_requires_review(alignment, None, locally_ambiguous=True)
+        )
+
+    def test_adjudicated_create_with_conflicts_still_waits_for_review(self) -> None:
+        alignment = {
+            "action": "create",
+            "decision_basis": "deepseek_adjudication",
+            "target_id": None,
+            "adjudication": {
+                "decision": "CREATE",
+                "confidence": 0.96,
+                "conflicts": ["与现有定义存在冲突"],
+                "needs_human_review": False,
+            },
+        }
+        self.assertTrue(
+            self.service._alignment_requires_review(alignment, None, locally_ambiguous=True)
+        )
 
     def test_cross_knowledge_question_returns_evidence(self) -> None:
         self.service.confirm(self._draft("BFS", "BFS 使用队列按层搜索无权图的最短路径。"))

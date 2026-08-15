@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 
 from PyInstaller.utils.hooks import collect_all
 
@@ -10,14 +11,20 @@ datas = []
 binaries = []
 hiddenimports = []
 
+# The packaging venv is created from a Conda interpreter. PyInstaller does not
+# recognize that parent environment through the venv and otherwise omits DLLs
+# required by Python's own stdlib extensions (sqlite3, expat, bz2, lzma, ffi).
+conda_library_bin = Path(sys.base_prefix) / "Library" / "bin"
+for dll_name in ("ffi.dll", "libbz2.dll", "libexpat.dll", "liblzma.dll", "sqlite3.dll"):
+    dll_path = conda_library_bin / dll_name
+    if dll_path.is_file():
+        binaries.append((str(dll_path), "."))
+
 for package in (
-    "av",
-    "ctranslate2",
-    "faster_whisper",
+    "kaldi_native_fbank",
     "opencc",
     "sounddevice",
     "tokenizers",
-    "onnxruntime",
     "vosk",
     "_sounddevice_data",
 ):
@@ -26,7 +33,7 @@ for package in (
     binaries += package_binaries
     hiddenimports += package_hidden
 
-hiddenimports += ["huggingface_hub", "onnxruntime"]
+hiddenimports += ["kaldi_native_fbank", "onnxruntime"]
 
 a = Analysis(
     [str(backend_dir / "runtime_entry.py")],

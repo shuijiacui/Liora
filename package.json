@@ -1,6 +1,6 @@
 {
   "name": "liora-desktop-companion",
-  "version": "0.2.4",
+  "version": "0.4.0",
   "description": "A local-first personal knowledge steward that turns reflection into structured memory and maintains an evidence-backed Obsidian knowledge base.",
   "main": "src/main.js",
   "scripts": {

@@ -1,11 +1,25 @@
 import { ItemView, Notice, setIcon, WorkspaceLeaf } from "obsidian";
 import type LioraKnowledgePlugin from "./main";
-import type { ChangeSet, GranularityCandidate, KnowledgeRelation } from "./knowledge-service";
+import type { ChangeSet, GranularityCandidate, KnowledgeRelation, RelationDecision } from "./knowledge-service";
+import { KnowledgeScopeModal } from "./knowledge-scope-modal";
+import { buildChangeSetReview } from "./changeset-review-model";
 
 export const LIORA_MANAGER_VIEW = "liora-knowledge-manager";
 
 type ManagerTab = "review" | "relations" | "structure" | "history";
 type ActionTone = "primary" | "quiet" | "danger";
+
+const RELATION_LABELS: Record<string, string> = {
+  conceptual_overlap: "共享核心概念",
+  explains: "解释关系",
+  example_of: "原理与实例",
+  applies_to: "原理与应用",
+  contrasts_with: "对比关系",
+  prerequisite_of: "前置关系",
+  duplicates: "内容高度重合",
+  explicit_reference: "正文明确引用",
+  causal_continuation: "因果链衔接"
+};
 
 function display(value: unknown): string {
   if (value === null || value === undefined || value === "") return "（空）";
@@ -59,11 +73,12 @@ export class LioraManagerView extends ItemView {
     const loading = canvas.createDiv({ cls: "liora-manager__loading", text: "Liora 正在巡视知识花园…" });
     const service = this.plugin.createKnowledgeService();
     try {
-      const [changes, appliedChanges, relations, granularity] = await Promise.all([
-        service.loadChangeSets(), service.loadChangeSets("applied"), service.loadRelations(), service.loadGranularityData()
+      const [changes, appliedChanges, relations, relationDecisions, granularity] = await Promise.all([
+        service.loadChangeSets(), service.loadChangeSets("applied"), service.loadRelations(),
+        service.loadRelationDecisions(), service.loadGranularityData()
       ]);
       loading.remove();
-      this.renderDashboard(canvas, changes, appliedChanges, relations, granularity.items, granularity.hierarchy);
+      this.renderDashboard(canvas, changes, appliedChanges, relations, relationDecisions, granularity.items, granularity.hierarchy);
     } catch (error) {
       loading.setText(error instanceof Error ? error.message : "Liora 管理台暂时打不开。");
       loading.addClass("liora-manager__error");
@@ -83,6 +98,8 @@ export class LioraManagerView extends ItemView {
     const tools = header.createDiv({ cls: "liora-manager__tools" });
     const home = iconButton(tools, "home", "返回 Liora Home");
     home.addEventListener("click", () => void this.plugin.activateHome());
+    const scope = iconButton(tools, "list-tree", "确认知识管理范围");
+    scope.addEventListener("click", () => new KnowledgeScopeModal(this.plugin).open());
     const refresh = iconButton(tools, "refresh-cw", "重新检查知识库");
     refresh.addEventListener("click", () => void this.render());
   }
@@ -92,6 +109,7 @@ export class LioraManagerView extends ItemView {
     changes: ChangeSet[],
     appliedChanges: ChangeSet[],
     relations: KnowledgeRelation[],
+    relationDecisions: RelationDecision[],
     granularity: GranularityCandidate[],
     hierarchy: Array<{ parent: { title: string; path: string }; child: { title: string; path: string } }>
   ): void {
@@ -109,7 +127,7 @@ export class LioraManagerView extends ItemView {
       { id: "review", label: "待你确认", note: "有风险的改动", icon: "inbox", count: changes.length },
       { id: "relations", label: "新关联", note: "等待判断的线索", icon: "waypoints", count: candidates },
       { id: "structure", label: "知识结构", note: "粒度与层级", icon: "network", count: granularity.length + hierarchy.length },
-      { id: "history", label: "照料记录", note: "最近已应用", icon: "history", count: appliedChanges.length }
+      { id: "history", label: "照料记录", note: "变更与关联决策", icon: "history", count: appliedChanges.length + relationDecisions.length }
     ];
 
     const buttons = new Map<ManagerTab, HTMLButtonElement>();
@@ -126,7 +144,7 @@ export class LioraManagerView extends ItemView {
         this.renderGranularity(main, granularity);
         this.renderHierarchy(main, hierarchy);
       }
-      if (this.activeTab === "history") this.renderAppliedChanges(main, appliedChanges);
+      if (this.activeTab === "history") this.renderCareLog(main, appliedChanges, relationDecisions);
     };
 
     for (const tab of tabs) {
@@ -177,23 +195,60 @@ export class LioraManagerView extends ItemView {
     if (!items.length) return void section.createDiv({ cls: "liora-manager-empty is-celebrate", text: "今天很安静，没有需要你决定的变更。" });
     const list = section.createDiv({ cls: "liora-manager-list" });
     for (const item of items) {
+      const review = buildChangeSetReview(item);
       const card = list.createDiv({ cls: "liora-manager-card is-review" });
       card.createDiv({ cls: `liora-manager-card__badge is-${item.action}`, text: item.action === "create" ? "新知识" : "内容调整" });
       card.createEl("h3", { text: item.title });
       card.createEl("p", { text: item.reason });
       const details = card.createEl("details");
-      details.createEl("summary", { text: `查看 ${item.diff.length} 处差异` });
-      for (const change of item.diff) {
-        const row = details.createDiv({ cls: "liora-diff" });
-        row.createEl("strong", { text: change.field });
-        row.createEl("pre", { cls: "liora-diff__before", text: display(change.before) });
-        row.createEl("pre", { cls: "liora-diff__after", text: display(change.after) });
+      details.createEl("summary", { text: review.summary });
+      for (const change of review.fields) {
+        const row = details.createDiv({ cls: `liora-diff is-${review.mode}` });
+        row.createEl("strong", { text: change.label });
+        if (review.mode === "update") {
+          const before = row.createDiv({ cls: "liora-diff__version" });
+          before.createDiv({ cls: "liora-diff__label", text: "原内容" });
+          before.createEl("pre", { cls: "liora-diff__before", text: display(change.before) });
+        }
+        const after = row.createDiv({ cls: "liora-diff__version" });
+        after.createDiv({ cls: "liora-diff__label", text: review.mode === "create" ? "拟写入" : "调整后" });
+        after.createEl("pre", { cls: "liora-diff__after", text: display(change.after) });
       }
       this.actions(card, [
-        ["确认这样改", async () => this.plugin.createKnowledgeService().applyChangeSet(item.id), "primary"],
-        ["暂时不改", async () => this.plugin.createKnowledgeService().rejectChangeSet(item.id), "quiet"]
+        [review.mode === "create" ? "创建这篇知识" : "确认这样改", async () => this.plugin.createKnowledgeService().applyChangeSet(item.id), "primary"],
+        [review.mode === "create" ? "暂不创建" : "暂时不改", async () => this.plugin.createKnowledgeService().rejectChangeSet(item.id), "quiet"]
       ]);
     }
+  }
+
+  private renderCareLog(root: HTMLElement, changes: ChangeSet[], decisions: RelationDecision[]): void {
+    const section = this.section(
+      root, "CARE LOG", "最近的照料决定", changes.length + decisions.length,
+      "建立、忽略或重新考虑关联后，卡片会从待确认区移到这里，并保留当时的证据快照。"
+    );
+    if (!changes.length && !decisions.length) {
+      return void section.createDiv({ cls: "liora-manager-empty", text: "Liora 还没有记录知识变更或关联决定。" });
+    }
+    if (decisions.length) {
+      const list = section.createDiv({ cls: "liora-manager-list liora-manager-list--history" });
+      const actionLabels = { confirmed: "已建立关联", rejected: "已忽略", restored: "已放回待确认" } as const;
+      for (const item of decisions.slice(0, 30)) {
+        const card = list.createDiv({ cls: "liora-manager-card is-history is-relation" });
+        card.createDiv({ cls: "liora-manager-card__badge", text: actionLabels[item.action] ?? item.action });
+        card.createEl("h3", { text: `${item.source.title || "未知知识"} → ${item.target.title || "未知知识"}` });
+        card.createEl("p", { text: item.learning_payoff || item.evidence?.learningPayoff || "已保留当时的关系证据。" });
+        if (item.evidence?.sourceExcerpt && item.evidence?.targetExcerpt) {
+          const details = card.createEl("details");
+          details.createEl("summary", { text: "查看当时的双侧证据" });
+          details.createEl("blockquote", { text: item.evidence.sourceExcerpt });
+          details.createEl("blockquote", { text: item.evidence.targetExcerpt });
+        }
+        if (item.action !== "restored") this.actions(card, [[
+          "重新放回待确认", async () => this.plugin.createKnowledgeService().updateRelation(item.relation_id, "restore"), "quiet"
+        ]]);
+      }
+    }
+    if (changes.length) this.renderAppliedChanges(root, changes);
   }
 
   private renderAsk(root: HTMLElement): void {
@@ -223,47 +278,68 @@ export class LioraManagerView extends ItemView {
   }
 
   private renderRelations(root: HTMLElement, items: KnowledgeRelation[]): void {
-    const section = this.section(root, "NEW CONNECTIONS", "Liora 发现的新关联", items.length, "置信度只是线索强弱，真正是否有关联仍由你判断。");
-    if (!items.length) return void section.createDiv({ cls: "liora-manager-empty", text: "暂时没有发现新的知识联系。" });
+    const strict = items.filter((item) => item.status === "candidate" && ["typed_path", "hard"].includes(item.kind));
+    const section = this.section(
+      root, "HIGH-VALUE CONNECTIONS", "值得你判断的新关联", strict.length,
+      "这里只出现能组成有效路径的关系：双侧原文、连接中介、学习收益和失效条件必须同时存在。相似或思维标签本身不会成为建议。"
+    );
+    if (!strict.length) return void section.createDiv({ cls: "liora-manager-empty", text: "目前没有通过严格门槛的新关联；少而可信比凑数更重要。" });
     const list = section.createDiv({ cls: "liora-manager-list liora-manager-list--relations" });
-    for (const item of items.slice(0, 20)) {
-      const card = list.createDiv({ cls: "liora-manager-card is-relation" });
-      card.createDiv({ cls: "liora-manager-card__badge", text: item.kind === "hard" ? "明确关联" : "柔性线索" });
-      const relation = card.createDiv({ cls: "liora-manager-card__relation" });
-      const sourceTitle = relation.createEl("button", { text: item.source.title || "未知知识", attr: { title: "打开来源知识" } });
-      const linkIcon = relation.createSpan();
-      setIcon(linkIcon, "arrow-left-right");
-      const targetTitle = relation.createEl("button", { text: item.target.title || "未知知识", attr: { title: "打开目标知识" } });
-      if (item.source.relative_path) sourceTitle.addEventListener("click", () => void this.plugin.createKnowledgeService().openKnowledge(item.source.relative_path ?? ""));
-      else sourceTitle.disabled = true;
-      if (item.target.relative_path) targetTitle.addEventListener("click", () => void this.plugin.createKnowledgeService().openKnowledge(item.target.relative_path ?? ""));
-      else targetTitle.disabled = true;
-      card.createEl("p", { text: item.reason });
-      if (item.evidence) {
-        const evidence = card.createDiv({ cls: "liora-relation-evidence" });
-        const source = evidence.createDiv({ cls: "liora-relation-evidence__passage" });
-        source.createDiv({ cls: "liora-relation-evidence__label", text: `《${item.source.title || "来源知识"}》中的内容` });
-        source.createEl("blockquote", { text: item.evidence.sourceExcerpt });
-        const bridge = evidence.createDiv({ cls: "liora-relation-evidence__bridge" });
-        setIcon(bridge.createSpan(), item.evidence.basis === "explicit" ? "link" : "sparkles");
-        bridge.createSpan({ text: item.evidence.basis === "explicit" ? "正文明确指向" : "与下面这段语义相近" });
-        const target = evidence.createDiv({ cls: "liora-relation-evidence__passage" });
-        target.createDiv({ cls: "liora-relation-evidence__label", text: `《${item.target.title || "目标知识"}》中的内容` });
-        target.createEl("blockquote", { text: item.evidence.targetExcerpt });
-      } else {
-        card.createDiv({ cls: "liora-relation-evidence__missing", text: "暂时无法读取对应的 Markdown 原文，请确认两条知识仍在当前 Vault 中。" });
+    for (const item of strict.slice(0, 8)) this.renderRelationCard(list, { ...item, category: "knowledge" });
+  }
+
+  private renderRelationCard(list: HTMLElement, item: KnowledgeRelation): void {
+    const card = list.createDiv({ cls: "liora-manager-card is-relation is-knowledge" });
+    const relationLabel = RELATION_LABELS[item.label ?? ""] ?? "知识路径";
+    const badges = card.createDiv({ cls: "liora-manager-card__badges" });
+    badges.createDiv({ cls: "liora-manager-card__badge is-knowledge", text: "知识路径" });
+    badges.createDiv({ cls: "liora-manager-card__relation-type", text: relationLabel });
+    const relation = card.createDiv({ cls: "liora-manager-card__relation" });
+    const sourceTitle = relation.createEl("button", { text: item.source.title || "未知知识", attr: { title: "打开来源知识" } });
+    const linkIcon = relation.createSpan();
+    setIcon(linkIcon, "arrow-left-right");
+    const targetTitle = relation.createEl("button", { text: item.target.title || "未知知识", attr: { title: "打开目标知识" } });
+    if (item.source.relative_path) sourceTitle.addEventListener("click", () => void this.plugin.createKnowledgeService().openKnowledge(item.source.relative_path ?? ""));
+    else sourceTitle.disabled = true;
+    if (item.target.relative_path) targetTitle.addEventListener("click", () => void this.plugin.createKnowledgeService().openKnowledge(item.target.relative_path ?? ""));
+    else targetTitle.disabled = true;
+    card.createEl("p", { text: item.reason });
+    if (item.evidence?.sourceExcerpt && item.evidence?.targetExcerpt) {
+      const evidence = card.createDiv({ cls: "liora-relation-evidence" });
+      const source = evidence.createDiv({ cls: "liora-relation-evidence__passage" });
+      source.createDiv({ cls: "liora-relation-evidence__label", text: `${item.evidence.sourceSection ? `${item.evidence.sourceSection} · ` : ""}《${item.source.title || "来源知识"}》` });
+      source.createEl("blockquote", { text: item.evidence.sourceExcerpt });
+      const bridge = evidence.createDiv({ cls: "liora-relation-evidence__bridge" });
+      setIcon(bridge.createSpan(), item.evidence.basis === "explicit" ? "link" : "route");
+      bridge.createSpan({ text: item.evidence.bridge || (item.evidence.basis === "explicit" ? "正文明确指向" : "正文片段相互支持") });
+      const target = evidence.createDiv({ cls: "liora-relation-evidence__passage" });
+      target.createDiv({ cls: "liora-relation-evidence__label", text: `${item.evidence.targetSection ? `${item.evidence.targetSection} · ` : ""}《${item.target.title || "目标知识"}》` });
+      target.createEl("blockquote", { text: item.evidence.targetExcerpt });
+      if (item.evidence.learningPayoff) {
+        const payoff = card.createDiv({ cls: "liora-relation-evidence__missing" });
+        payoff.createEl("strong", { text: "为什么值得看：" });
+        payoff.createSpan({ text: item.evidence.learningPayoff });
       }
-      const confidence = Math.round(item.confidence * 100);
-      const meter = card.createDiv({ cls: "liora-confidence" });
-      meter.createSpan({ text: `线索强度 ${confidence}%` });
-      const track = meter.createDiv();
-      const fill = track.createDiv();
-      fill.style.width = `${confidence}%`;
-      if (item.status === "candidate") this.actions(card, [
-        ["确认有关联", async () => this.plugin.createKnowledgeService().updateRelation(item.id, "confirm"), "primary"],
-        ["忽略这条线索", async () => this.plugin.createKnowledgeService().updateRelation(item.id, "reject"), "quiet"]
-      ]);
+      if (item.evidence.failureConditions?.length) {
+        const failures = card.createEl("details");
+        failures.createEl("summary", { text: "这条关联什么时候不成立？" });
+        const failureList = failures.createEl("ul");
+        for (const condition of item.evidence.failureConditions) failureList.createEl("li", { text: condition });
+      }
+    } else {
+      card.createDiv({ cls: "liora-relation-evidence__missing", text: "这条线索缺少双侧正文证据，Liora 不会建议确认它。" });
     }
+    const confidence = Math.round(item.confidence * 100);
+    const meter = card.createDiv({ cls: "liora-confidence" });
+    meter.createSpan({ text: `路径证据 ${confidence}%` });
+    const track = meter.createDiv();
+    const fill = track.createDiv();
+    fill.style.width = `${confidence}%`;
+    const confirmLabel = "建立这条关联";
+    if (item.status === "candidate" && item.evidence?.sourceExcerpt && item.evidence?.targetExcerpt) this.actions(card, [
+      [confirmLabel, async () => this.plugin.createKnowledgeService().updateRelation(item.id, "confirm", "learning_value_confirmed"), "primary"],
+      ["忽略这条线索", async () => this.plugin.createKnowledgeService().updateRelation(item.id, "reject", "not_useful_now"), "quiet"]
+    ]);
   }
 
   private renderGranularity(root: HTMLElement, items: GranularityCandidate[]): void {
@@ -274,8 +350,39 @@ export class LioraManagerView extends ItemView {
       const card = list.createDiv({ cls: "liora-manager-card is-structure" });
       card.createDiv({ cls: "liora-manager-card__badge", text: item.kind === "split" ? "建议拆分" : "建议合并" });
       card.createEl("h3", { text: item.sources.map((source) => source.title).join(" + ") });
-      card.createDiv({ cls: "liora-manager-card__score", text: `建议分数 ${Math.round(item.score * 100)}%` });
-      card.createEl("p", { text: Object.entries(item.reasons).map(([key, value]) => `${key} ${Math.round(value * 100)}%`).join(" · ") });
+      const proposal = item.proposal as {
+        rationale?: string;
+        strategy?: string;
+        parent_after?: { note?: string; retains?: string[] };
+        children?: Array<{ title?: string; purpose?: string; diagnostic_question?: string; source_excerpts?: string[] }>;
+        migration_steps?: string[];
+        failure_conditions?: string[];
+        reversible?: boolean;
+      };
+      card.createEl("p", { text: proposal.rationale || (item.kind === "split" ? "这篇知识包含多个可独立检索的主题。" : "两篇知识高度重合。") });
+      if (item.kind === "split" && proposal.children?.length) {
+        const details = card.createEl("details");
+        details.createEl("summary", { text: `预览如何拆成 ${proposal.children.length} 篇` });
+        for (const [index, child] of proposal.children.entries()) {
+          const childPlan = details.createDiv({ cls: "liora-diff is-create" });
+          childPlan.createEl("strong", { text: `${index + 1}. ${child.title || "未命名子知识"}` });
+          childPlan.createEl("p", { text: child.purpose || "形成可单独检索的知识单元。" });
+          if (child.diagnostic_question) childPlan.createEl("p", { text: `拆分后的检查问题：${child.diagnostic_question}` });
+          const excerpts = child.source_excerpts ?? [];
+          if (excerpts.length) childPlan.createEl("pre", { text: excerpts.map((excerpt) => `• ${excerpt}`).join("\n") });
+        }
+        if (proposal.migration_steps?.length) {
+          details.createEl("h4", { text: "执行步骤" });
+          const steps = details.createEl("ol");
+          for (const step of proposal.migration_steps) steps.createEl("li", { text: step });
+        }
+        if (proposal.failure_conditions?.length) {
+          details.createEl("h4", { text: "不应拆分的情况" });
+          const failures = details.createEl("ul");
+          for (const condition of proposal.failure_conditions) failures.createEl("li", { text: condition });
+        }
+        if (proposal.parent_after?.note) details.createEl("p", { text: `安全策略：${proposal.parent_after.note}` });
+      }
       this.actions(card, [
         [item.kind === "split" ? "确认拆分" : "确认合并", async () => this.plugin.createKnowledgeService().updateGranularity(item.id, "apply"), "primary"],
         ["保持现在这样", async () => this.plugin.createKnowledgeService().updateGranularity(item.id, "reject"), "quiet"]

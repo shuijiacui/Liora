@@ -184,6 +184,34 @@ class DeepSeekClientTests(unittest.TestCase):
                     [{"knowledge_id": "bfs", "title": "广度优先搜索", "score": 0.54}],
                 )
 
+    def test_cognitive_profile_keeps_only_schema_bound_verbatim_evidence(self) -> None:
+        settings = DeepSeekSettings(
+            api_key="test-secret",
+            base_url="https://api.deepseek.com",
+            model="deepseek-chat",
+            timeout_seconds=5,
+        )
+        client = DeepSeekClient(settings)
+        response = FakeResponse(
+            {
+                "choices": [{"message": {"role": "assistant", "content": json.dumps({
+                    "patterns": [
+                        {"id": "decomposition", "description": "拆成独立工作单元", "evidence": "把大型项目分解为可独立推进的工作单元。", "section": "core_insight", "confidence": 0.91},
+                        {"id": "worldview", "description": "模型自由联想", "evidence": "把大型项目分解为可独立推进的工作单元。", "section": "core_insight", "confidence": 0.99},
+                        {"id": "abstraction", "description": "没有原文支持", "evidence": "这是模型改写而不是原句。", "section": "core_insight", "confidence": 0.95},
+                    ],
+                    "problem_structure": "把整体任务转化为可独立处理的局部任务",
+                }, ensure_ascii=False)}}]
+            }
+        )
+        with patch("deepseek_client.urlopen", return_value=response):
+            result = client.analyze_cognitive_profile(
+                "项目规划",
+                [{"section": "core_insight", "text": "把大型项目分解为可独立推进的工作单元。"}],
+            )
+        self.assertEqual([item["id"] for item in result["patterns"]], ["decomposition"])
+        self.assertEqual(result["patterns"][0]["evidence"], "把大型项目分解为可独立推进的工作单元。")
+
 
 if __name__ == "__main__":
     unittest.main()

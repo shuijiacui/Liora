@@ -4,6 +4,7 @@ import uuid
 import json
 import math
 import re
+import struct
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -39,7 +40,9 @@ class ReflectionDatabase:
                     prompt_id TEXT,
                     prompt_kind TEXT,
                     prompt_text TEXT,
-                    prompt_reason TEXT
+                    prompt_reason TEXT,
+                    target_kc_ids_json TEXT NOT NULL DEFAULT '[]',
+                    rubric_json TEXT NOT NULL DEFAULT '{}'
                 );
 
                 CREATE TABLE IF NOT EXISTS reflection_messages (
@@ -199,13 +202,169 @@ class ReflectionDatabase:
                     confidence REAL NOT NULL,
                     reason TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'knowledge',
+                    evidence_json TEXT NOT NULL DEFAULT '{}',
+                    features_json TEXT NOT NULL DEFAULT '{}',
+                    pipeline_version TEXT NOT NULL DEFAULT 'legacy',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(source_id, target_id, label)
                 );
 
+                CREATE TABLE IF NOT EXISTS knowledge_chunks (
+                    id TEXT PRIMARY KEY,
+                    knowledge_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    section TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    vector_blob BLOB NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_knowledge
+                ON knowledge_chunks(knowledge_id, section, ordinal);
+
+                CREATE TABLE IF NOT EXISTS knowledge_cognitive_profiles (
+                    knowledge_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    profile_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_knowledge_relations_status
                 ON knowledge_relations(status, kind, confidence DESC);
+
+                CREATE TABLE IF NOT EXISTS knowledge_claims (
+                    id TEXT PRIMARY KEY,
+                    knowledge_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    claim_type TEXT NOT NULL,
+                    subject TEXT NOT NULL DEFAULT '',
+                    predicate TEXT NOT NULL DEFAULT '',
+                    object_text TEXT NOT NULL DEFAULT '',
+                    mechanism TEXT NOT NULL DEFAULT '',
+                    conditions_json TEXT NOT NULL DEFAULT '[]',
+                    polarity TEXT NOT NULL DEFAULT 'positive',
+                    section TEXT NOT NULL,
+                    section_label TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    evidence TEXT NOT NULL,
+                    start_offset INTEGER NOT NULL DEFAULT -1,
+                    end_offset INTEGER NOT NULL DEFAULT -1,
+                    model TEXT NOT NULL,
+                    pipeline_version TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_knowledge_claims_document
+                ON knowledge_claims(knowledge_id, section, ordinal);
+
+                CREATE TABLE IF NOT EXISTS knowledge_components (
+                    id TEXT PRIMARY KEY,
+                    knowledge_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    claim_ids_json TEXT NOT NULL DEFAULT '[]',
+                    prerequisite_ids_json TEXT NOT NULL DEFAULT '[]',
+                    fingerprint TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    pipeline_version TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_knowledge_components_document
+                ON knowledge_components(knowledge_id, ordinal);
+
+                CREATE TABLE IF NOT EXISTS kc_states (
+                    kc_id TEXT PRIMARY KEY,
+                    mastery REAL NOT NULL DEFAULT 0.35,
+                    uncertainty REAL NOT NULL DEFAULT 0.75,
+                    stability_days REAL NOT NULL DEFAULT 0,
+                    retrievability REAL NOT NULL DEFAULT 0,
+                    transfer_level REAL NOT NULL DEFAULT 0,
+                    misconceptions_json TEXT NOT NULL DEFAULT '[]',
+                    evidence_count INTEGER NOT NULL DEFAULT 0,
+                    last_evidence_type TEXT,
+                    last_evidence_at TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS kc_evidence (
+                    id TEXT PRIMARY KEY,
+                    kc_id TEXT NOT NULL,
+                    session_id TEXT,
+                    evidence_type TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    independent_recall INTEGER,
+                    hint_count INTEGER NOT NULL DEFAULT 0,
+                    misconceptions_json TEXT NOT NULL DEFAULT '[]',
+                    state_before_json TEXT NOT NULL DEFAULT '{}',
+                    state_after_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_kc_evidence_component
+                ON kc_evidence(kc_id, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS insight_paths (
+                    id TEXT PRIMARY KEY,
+                    canonical_key TEXT NOT NULL UNIQUE,
+                    source_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    relation_type TEXT NOT NULL,
+                    path_json TEXT NOT NULL,
+                    learning_payoff TEXT NOT NULL,
+                    failure_conditions_json TEXT NOT NULL DEFAULT '[]',
+                    verification TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    pipeline_version TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS relation_decisions (
+                    id TEXT PRIMARY KEY,
+                    relation_id TEXT NOT NULL,
+                    canonical_key TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    reason_code TEXT NOT NULL DEFAULT '',
+                    source_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                    target_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                    path_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                    learning_payoff TEXT NOT NULL DEFAULT '',
+                    pipeline_version TEXT NOT NULL,
+                    decided_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_relation_decisions_recent
+                ON relation_decisions(decided_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_relation_decisions_canonical
+                ON relation_decisions(canonical_key, decided_at DESC);
+
+                CREATE TABLE IF NOT EXISTS recommendation_feedback (
+                    id TEXT PRIMARY KEY,
+                    recommendation_id TEXT NOT NULL,
+                    feedback_scope TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    details TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_usage_events (
+                    id TEXT PRIMARY KEY,
+                    purpose TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    prompt_cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                    prompt_cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS granularity_candidates (
                     id TEXT PRIMARY KEY,
@@ -249,6 +408,8 @@ class ReflectionDatabase:
                 "prompt_kind": "ALTER TABLE reflection_sessions ADD COLUMN prompt_kind TEXT",
                 "prompt_text": "ALTER TABLE reflection_sessions ADD COLUMN prompt_text TEXT",
                 "prompt_reason": "ALTER TABLE reflection_sessions ADD COLUMN prompt_reason TEXT",
+                "target_kc_ids_json": "ALTER TABLE reflection_sessions ADD COLUMN target_kc_ids_json TEXT NOT NULL DEFAULT '[]'",
+                "rubric_json": "ALTER TABLE reflection_sessions ADD COLUMN rubric_json TEXT NOT NULL DEFAULT '{}'",
             }
             for column, statement in session_migrations.items():
                 if column not in session_columns:
@@ -269,6 +430,31 @@ class ReflectionDatabase:
             }
             for column, statement in document_migrations.items():
                 if column not in document_columns:
+                    self._connection.execute(statement)
+            relation_columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(knowledge_relations)").fetchall()
+            }
+            relation_migrations = {
+                "category": "ALTER TABLE knowledge_relations ADD COLUMN category TEXT NOT NULL DEFAULT 'knowledge'",
+                "evidence_json": "ALTER TABLE knowledge_relations ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}'",
+                "features_json": "ALTER TABLE knowledge_relations ADD COLUMN features_json TEXT NOT NULL DEFAULT '{}'",
+                "pipeline_version": "ALTER TABLE knowledge_relations ADD COLUMN pipeline_version TEXT NOT NULL DEFAULT 'legacy'",
+            }
+            for column, statement in relation_migrations.items():
+                if column not in relation_columns:
+                    self._connection.execute(statement)
+            learning_event_columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(learning_events)").fetchall()
+            }
+            learning_event_migrations = {
+                "target_kc_ids_json": "ALTER TABLE learning_events ADD COLUMN target_kc_ids_json TEXT NOT NULL DEFAULT '[]'",
+                "outcome": "ALTER TABLE learning_events ADD COLUMN outcome TEXT NOT NULL DEFAULT ''",
+                "misconceptions_json": "ALTER TABLE learning_events ADD COLUMN misconceptions_json TEXT NOT NULL DEFAULT '[]'",
+            }
+            for column, statement in learning_event_migrations.items():
+                if column not in learning_event_columns:
                     self._connection.execute(statement)
             # The Vault boundary defines knowledge membership. Upgrade notes
             # indexed by earlier versions, which treated frontmatter markers as
@@ -326,16 +512,20 @@ class ReflectionDatabase:
             "prompt_kind": prompt.get("kind"),
             "prompt_text": prompt.get("prompt"),
             "prompt_reason": prompt.get("reason"),
+            "target_kc_ids_json": json.dumps(prompt.get("target_kc_ids") or [], ensure_ascii=False),
+            "rubric_json": json.dumps(prompt.get("rubric") or {}, ensure_ascii=False),
         }
         with self._lock, self._connection:
             self._connection.execute(
                 """
                 INSERT INTO reflection_sessions
                     (id, started_at, completed_at, status, summary, knowledge_id,
-                     session_type, prompt_id, prompt_kind, prompt_text, prompt_reason)
+                     session_type, prompt_id, prompt_kind, prompt_text, prompt_reason,
+                     target_kc_ids_json, rubric_json)
                 VALUES
                     (:id, :started_at, :completed_at, :status, :summary, :knowledge_id,
-                     :session_type, :prompt_id, :prompt_kind, :prompt_text, :prompt_reason)
+                     :session_type, :prompt_id, :prompt_kind, :prompt_text, :prompt_reason,
+                     :target_kc_ids_json, :rubric_json)
                 """,
                 session,
             )
@@ -1111,6 +1301,8 @@ class ReflectionDatabase:
         independent_recall: bool | None = None,
         hint_count: int | None = None,
         misconception_count: int | None = None,
+        outcome: str | None = None,
+        misconceptions: list[str] | None = None,
     ) -> dict:
         normalized = str(rating or "").strip().lower()
         if normalized not in {"again", "hard", "good", "easy"}:
@@ -1159,6 +1351,17 @@ class ReflectionDatabase:
             occurred_text = occurred.isoformat(timespec="seconds")
             next_entry = (occurred + timedelta(days=stability)).isoformat(timespec="seconds")
             count = int(state["reflection_count"] or 0) + 1 if state else 1
+            target_kc_ids = json.loads(session["target_kc_ids_json"] or "[]")
+            normalized_outcome = str(outcome or "").strip().lower()
+            if normalized_outcome not in {"correct", "partial", "incorrect", "unknown"}:
+                normalized_outcome = {
+                    "easy": "correct", "good": "correct", "hard": "partial", "again": "incorrect"
+                }[normalized]
+            normalized_misconceptions = [
+                " ".join(str(item or "").split()).strip()[:160]
+                for item in (misconceptions or [])[:12]
+                if " ".join(str(item or "").split()).strip()
+            ]
             event = {
                 "id": str(uuid.uuid4()),
                 "session_id": session_id,
@@ -1173,17 +1376,22 @@ class ReflectionDatabase:
                 ),
                 "knowledge_changed": 1,
                 "occurred_at": occurred_text,
+                "target_kc_ids_json": json.dumps(target_kc_ids, ensure_ascii=False),
+                "outcome": normalized_outcome,
+                "misconceptions_json": json.dumps(normalized_misconceptions, ensure_ascii=False),
             }
             self._connection.execute(
                 """
                 INSERT INTO learning_events
                     (id, session_id, knowledge_id, prompt_id, prompt_kind, rating,
                      independent_recall, hint_count, misconception_count,
-                     knowledge_changed, occurred_at)
+                     knowledge_changed, occurred_at, target_kc_ids_json,
+                     outcome, misconceptions_json)
                 VALUES
                     (:id, :session_id, :knowledge_id, :prompt_id, :prompt_kind, :rating,
                      :independent_recall, :hint_count, :misconception_count,
-                     :knowledge_changed, :occurred_at)
+                     :knowledge_changed, :occurred_at, :target_kc_ids_json,
+                     :outcome, :misconceptions_json)
                 """,
                 event,
             )
@@ -1397,6 +1605,351 @@ class ReflectionDatabase:
             for row in rows
         }
 
+    @staticmethod
+    def _pack_half_vector(vector: list[float]) -> bytes:
+        return struct.pack(f"<{len(vector)}e", *vector) if vector else b""
+
+    @staticmethod
+    def _unpack_half_vector(value: bytes, dimensions: int) -> list[float]:
+        if not value or dimensions <= 0:
+            return []
+        return [float(item) for item in struct.unpack(f"<{dimensions}e", value)]
+
+    def list_knowledge_chunks(self) -> dict[str, dict]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM knowledge_chunks ORDER BY knowledge_id, section, ordinal"
+            ).fetchall()
+        result = {}
+        for row in rows:
+            item = dict(row)
+            vector_blob = item.pop("vector_blob")
+            item["embedding"] = self._unpack_half_vector(
+                vector_blob, int(item["dimensions"])
+            )
+            result[row["id"]] = item
+        return result
+
+    def replace_knowledge_chunks(self, chunks: list[dict], model: str) -> None:
+        now = utc_now()
+        active_ids = {str(item["id"]) for item in chunks}
+        with self._lock, self._connection:
+            existing_ids = {
+                row["id"] for row in self._connection.execute("SELECT id FROM knowledge_chunks").fetchall()
+            }
+            stale = existing_ids - active_ids
+            if stale:
+                self._connection.executemany(
+                    "DELETE FROM knowledge_chunks WHERE id = ?",
+                    [(item,) for item in stale],
+                )
+            self._connection.executemany(
+                """
+                INSERT INTO knowledge_chunks (
+                    id, knowledge_id, fingerprint, section, ordinal, text,
+                    model, dimensions, vector_blob, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    knowledge_id = excluded.knowledge_id,
+                    fingerprint = excluded.fingerprint,
+                    section = excluded.section,
+                    ordinal = excluded.ordinal,
+                    text = excluded.text,
+                    model = excluded.model,
+                    dimensions = excluded.dimensions,
+                    vector_blob = excluded.vector_blob,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        item["id"], item["knowledge_id"], item["fingerprint"],
+                        item["section"], int(item["ordinal"]), item["text"], model,
+                        len(item.get("embedding") or []),
+                        self._pack_half_vector(item.get("embedding") or []), now,
+                    )
+                    for item in chunks
+                ],
+            )
+
+    def list_cognitive_profiles(self) -> dict[str, dict]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM knowledge_cognitive_profiles"
+            ).fetchall()
+        return {
+            row["knowledge_id"]: {
+                **dict(row),
+                "profile": json.loads(row["profile_json"]),
+            }
+            for row in rows
+        }
+
+    def upsert_cognitive_profile(
+        self, knowledge_id: str, fingerprint: str, model: str, profile: dict
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO knowledge_cognitive_profiles
+                    (knowledge_id, fingerprint, model, profile_json, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(knowledge_id) DO UPDATE SET
+                    fingerprint = excluded.fingerprint,
+                    model = excluded.model,
+                    profile_json = excluded.profile_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    knowledge_id,
+                    fingerprint,
+                    model,
+                    json.dumps(profile, ensure_ascii=False),
+                    utc_now(),
+                ),
+            )
+
+    def count_cognitive_profiles_since(self, moment: str, model_prefix: str = "deepseek:") -> int:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) FROM knowledge_cognitive_profiles
+                WHERE updated_at >= ? AND model LIKE ?
+                """,
+                (moment, f"{model_prefix}%"),
+            ).fetchone()
+        return int(row[0])
+
+    def replace_grounded_structure(
+        self, knowledge_id: str, claims: list[dict], components: list[dict]
+    ) -> None:
+        """Replace derived claims/components while retaining stable KC states."""
+
+        now = utc_now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM knowledge_claims WHERE knowledge_id = ?", (knowledge_id,)
+            )
+            self._connection.execute(
+                "DELETE FROM knowledge_components WHERE knowledge_id = ?", (knowledge_id,)
+            )
+            self._connection.executemany(
+                """
+                INSERT INTO knowledge_claims (
+                    id, knowledge_id, fingerprint, claim_type, subject, predicate,
+                    object_text, mechanism, conditions_json, polarity, section,
+                    section_label, ordinal, evidence, start_offset, end_offset,
+                    model, pipeline_version, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        item["id"], knowledge_id, item["fingerprint"], item["claim_type"],
+                        item.get("subject", ""), item.get("predicate", ""),
+                        item.get("object", ""), item.get("mechanism", ""),
+                        json.dumps(item.get("conditions") or [], ensure_ascii=False),
+                        item.get("polarity", "positive"), item["section"],
+                        item.get("section_label", item["section"]), int(item.get("ordinal") or 0),
+                        item["evidence"], int(item.get("start_offset", -1)),
+                        int(item.get("end_offset", -1)), item.get("model", "local"),
+                        item.get("pipeline_version", "learning-engine-v4"), now,
+                    )
+                    for item in claims
+                ],
+            )
+            self._connection.executemany(
+                """
+                INSERT INTO knowledge_components (
+                    id, knowledge_id, title, question, claim_ids_json,
+                    prerequisite_ids_json, fingerprint, model, pipeline_version,
+                    ordinal, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        item["id"], knowledge_id, item["title"], item["question"],
+                        json.dumps(item.get("claim_ids") or [], ensure_ascii=False),
+                        json.dumps(item.get("prerequisite_ids") or [], ensure_ascii=False),
+                        item["fingerprint"], item.get("model", "local"),
+                        item.get("pipeline_version", "learning-engine-v4"),
+                        int(item.get("ordinal") or 0), now,
+                    )
+                    for item in components
+                ],
+            )
+
+    def list_grounded_claims(self) -> list[dict]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM knowledge_claims ORDER BY knowledge_id, section, ordinal"
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["object"] = item.pop("object_text", "")
+            item["conditions"] = json.loads(item.pop("conditions_json", "[]") or "[]")
+            result.append(item)
+        return result
+
+    def list_knowledge_components(self, knowledge_id: str | None = None) -> list[dict]:
+        with self._lock:
+            if knowledge_id:
+                rows = self._connection.execute(
+                    "SELECT * FROM knowledge_components WHERE knowledge_id = ? ORDER BY ordinal",
+                    (knowledge_id,),
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    "SELECT * FROM knowledge_components ORDER BY knowledge_id, ordinal"
+                ).fetchall()
+            states = {
+                row["kc_id"]: dict(row)
+                for row in self._connection.execute("SELECT * FROM kc_states").fetchall()
+            }
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["claim_ids"] = json.loads(item.pop("claim_ids_json", "[]") or "[]")
+            item["prerequisite_ids"] = json.loads(
+                item.pop("prerequisite_ids_json", "[]") or "[]"
+            )
+            state = states.get(item["id"])
+            if state:
+                state["misconceptions"] = json.loads(
+                    state.pop("misconceptions_json", "[]") or "[]"
+                )
+            item["state"] = state
+            result.append(item)
+        return result
+
+    def get_kc_state(self, kc_id: str) -> dict | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM kc_states WHERE kc_id = ?", (kc_id,)
+            ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        value["misconceptions"] = json.loads(
+            value.pop("misconceptions_json", "[]") or "[]"
+        )
+        return value
+
+    def record_kc_evidence(
+        self, kc_id: str, session_id: str | None, evidence: dict,
+        before: dict, after: dict,
+    ) -> dict:
+        event_id = str(uuid.uuid4())
+        now = utc_now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO kc_evidence (
+                    id, kc_id, session_id, evidence_type, outcome,
+                    independent_recall, hint_count, misconceptions_json,
+                    state_before_json, state_after_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id, kc_id, session_id, evidence.get("evidence_type", "recall"),
+                    evidence.get("outcome", "unknown"),
+                    None if evidence.get("independent_recall") is None else int(bool(evidence.get("independent_recall"))),
+                    max(int(evidence.get("hint_count") or 0), 0),
+                    json.dumps(evidence.get("misconceptions") or [], ensure_ascii=False),
+                    json.dumps(before or {}, ensure_ascii=False),
+                    json.dumps(after or {}, ensure_ascii=False), now,
+                ),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO kc_states (
+                    kc_id, mastery, uncertainty, stability_days, retrievability,
+                    transfer_level, misconceptions_json, evidence_count,
+                    last_evidence_type, last_evidence_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(kc_id) DO UPDATE SET
+                    mastery = excluded.mastery,
+                    uncertainty = excluded.uncertainty,
+                    stability_days = excluded.stability_days,
+                    retrievability = excluded.retrievability,
+                    transfer_level = excluded.transfer_level,
+                    misconceptions_json = excluded.misconceptions_json,
+                    evidence_count = excluded.evidence_count,
+                    last_evidence_type = excluded.last_evidence_type,
+                    last_evidence_at = excluded.last_evidence_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    kc_id, float(after.get("mastery") or 0.35),
+                    float(after.get("uncertainty") or 0.75),
+                    float(after.get("stability_days") or 0),
+                    float(after.get("retrievability") or 0),
+                    float(after.get("transfer_level") or 0),
+                    json.dumps(after.get("misconceptions") or [], ensure_ascii=False),
+                    int(after.get("evidence_count") or 0),
+                    after.get("last_evidence_type"), after.get("last_evidence_at"), now,
+                ),
+            )
+        return {"id": event_id, "kc_id": kc_id, "created_at": now, "state": after}
+
+    def record_ai_usage(self, purpose: str, model: str, usage: dict | None) -> None:
+        usage = usage or {}
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO ai_usage_events (
+                    id, purpose, model, prompt_tokens, prompt_cache_hit_tokens,
+                    prompt_cache_miss_tokens, completion_tokens, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()), purpose, model,
+                    int(usage.get("prompt_tokens") or 0),
+                    int(usage.get("prompt_cache_hit_tokens") or 0),
+                    int(usage.get("prompt_cache_miss_tokens") or 0),
+                    int(usage.get("completion_tokens") or 0), utc_now(),
+                ),
+            )
+
+    def ai_usage_since(self, moment: str) -> dict:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                       COALESCE(SUM(prompt_cache_hit_tokens), 0) AS prompt_cache_hit_tokens,
+                       COALESCE(SUM(prompt_cache_miss_tokens), 0) AS prompt_cache_miss_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                       COUNT(*) AS calls
+                FROM ai_usage_events WHERE created_at >= ?
+                """,
+                (moment,),
+            ).fetchone()
+        return dict(row)
+
+    def record_recommendation_feedback(
+        self, recommendation_id: str, feedback_scope: str, reason_code: str,
+        details: str = "",
+    ) -> dict:
+        item = {
+            "id": str(uuid.uuid4()),
+            "recommendation_id": str(recommendation_id or "")[:160],
+            "feedback_scope": str(feedback_scope or "prompt")[:40],
+            "reason_code": str(reason_code or "unknown")[:80],
+            "details": str(details or "")[:1000],
+            "created_at": utc_now(),
+        }
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO recommendation_feedback (
+                    id, recommendation_id, feedback_scope, reason_code, details, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                tuple(item[key] for key in (
+                    "id", "recommendation_id", "feedback_scope", "reason_code", "details", "created_at"
+                )),
+            )
+        return item
+
     def get_alignment_judgment(self, signature: str) -> dict | None:
         with self._lock:
             row = self._connection.execute(
@@ -1436,7 +1989,20 @@ class ReflectionDatabase:
             self._connection.execute(
                 "DELETE FROM knowledge_relations WHERE status = 'candidate'"
             )
+            latest_actions: dict[str, str] = {}
+            for row in self._connection.execute(
+                "SELECT canonical_key, action FROM relation_decisions ORDER BY decided_at DESC"
+            ).fetchall():
+                latest_actions.setdefault(row["canonical_key"], row["action"])
+            rejected_keys = {
+                key for key, action in latest_actions.items() if action == "rejected"
+            }
+            self._connection.execute("DELETE FROM insight_paths")
             for relation in relations:
+                features = relation.get("features") or {}
+                canonical_key = str(features.get("canonical_key") or "")
+                if relation.get("status") == "candidate" and canonical_key in rejected_keys:
+                    continue
                 left, right = sorted((relation["source_id"], relation["target_id"]))
                 relation_id = str(
                     uuid.uuid5(
@@ -1448,12 +2014,17 @@ class ReflectionDatabase:
                     """
                     INSERT INTO knowledge_relations (
                         id, source_id, target_id, kind, label, confidence,
-                        reason, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        reason, status, created_at, updated_at, category,
+                        evidence_json, features_json, pipeline_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(source_id, target_id, label) DO UPDATE SET
                         kind = excluded.kind,
+                        category = excluded.category,
                         confidence = excluded.confidence,
                         reason = excluded.reason,
+                        evidence_json = excluded.evidence_json,
+                        features_json = excluded.features_json,
+                        pipeline_version = excluded.pipeline_version,
                         status = CASE
                             WHEN knowledge_relations.status IN ('confirmed', 'rejected')
                             THEN knowledge_relations.status
@@ -1472,8 +2043,42 @@ class ReflectionDatabase:
                         relation["status"],
                         now,
                         now,
+                        relation.get("category", "knowledge"),
+                        json.dumps(relation.get("evidence") or {}, ensure_ascii=False),
+                        json.dumps(relation.get("features") or {}, ensure_ascii=False),
+                        relation.get("pipeline_version", "legacy"),
                     ),
                 )
+                evidence = relation.get("evidence") or {}
+                path = evidence.get("path")
+                if canonical_key and isinstance(path, list) and path:
+                    self._connection.execute(
+                        """
+                        INSERT INTO insight_paths (
+                            id, canonical_key, source_id, target_id, relation_type,
+                            path_json, learning_payoff, failure_conditions_json,
+                            verification, score, pipeline_version, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(canonical_key) DO UPDATE SET
+                            path_json = excluded.path_json,
+                            learning_payoff = excluded.learning_payoff,
+                            failure_conditions_json = excluded.failure_conditions_json,
+                            verification = excluded.verification,
+                            score = excluded.score,
+                            pipeline_version = excluded.pipeline_version,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            str(uuid.uuid5(uuid.NAMESPACE_URL, f"liora:path:{canonical_key}")),
+                            canonical_key, left, right, relation["label"],
+                            json.dumps(path, ensure_ascii=False),
+                            str(evidence.get("learning_payoff") or relation.get("reason") or ""),
+                            json.dumps(evidence.get("failure_conditions") or [], ensure_ascii=False),
+                            str(evidence.get("verification") or "unverified"),
+                            float(relation.get("confidence") or 0),
+                            relation.get("pipeline_version", "legacy"), now,
+                        ),
+                    )
 
     def list_relations(self, status: str = "", limit: int = 100) -> list[dict]:
         safe_limit = min(max(int(limit), 1), 300)
@@ -1491,7 +2096,7 @@ class ReflectionDatabase:
                     "SELECT * FROM knowledge_relations ORDER BY confidence DESC LIMIT ?",
                     (safe_limit,),
                 ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._relation_payload(row) for row in rows]
 
     def set_relation_status(self, relation_id: str, status: str) -> dict:
         if status not in {"candidate", "confirmed", "rejected"}:
@@ -1506,11 +2111,91 @@ class ReflectionDatabase:
             ).fetchone()
         if not row:
             raise LookupError("没有找到这条知识关系。")
-        return dict(row)
+        return self._relation_payload(row)
+
+    def resolve_relation(
+        self,
+        relation_id: str,
+        status: str,
+        reason_code: str = "",
+        source_snapshot: dict | None = None,
+        target_snapshot: dict | None = None,
+    ) -> dict:
+        if status not in {"confirmed", "rejected", "candidate"}:
+            raise ValueError("不支持的关系状态。")
+        now = utc_now()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM knowledge_relations WHERE id = ?", (relation_id,)
+            ).fetchone()
+            if not row:
+                raise LookupError("没有找到这条知识关系。")
+            relation = self._relation_payload(row)
+            self._connection.execute(
+                "UPDATE knowledge_relations SET status = ?, updated_at = ? WHERE id = ?",
+                (status, now, relation_id),
+            )
+            features = relation.get("features") or {}
+            evidence = relation.get("evidence") or {}
+            canonical_key = str(
+                features.get("canonical_key")
+                or uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"liora:relation-decision:{relation['source_id']}:{relation['target_id']}:{relation['label']}",
+                )
+            )
+            decision_action = status if status in {"confirmed", "rejected"} else "restored"
+            if status in {"confirmed", "rejected", "candidate"}:
+                self._connection.execute(
+                    """
+                    INSERT INTO relation_decisions (
+                        id, relation_id, canonical_key, action, reason_code,
+                        source_snapshot_json, target_snapshot_json,
+                        path_snapshot_json, learning_payoff, pipeline_version,
+                        decided_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()), relation_id, canonical_key, decision_action,
+                        str(reason_code or "")[:80],
+                        json.dumps(source_snapshot or {}, ensure_ascii=False),
+                        json.dumps(target_snapshot or {}, ensure_ascii=False),
+                        json.dumps(evidence, ensure_ascii=False),
+                        str(evidence.get("learning_payoff") or relation.get("reason") or "")[:1200],
+                        relation.get("pipeline_version", "legacy"), now,
+                    ),
+                )
+            updated = self._connection.execute(
+                "SELECT * FROM knowledge_relations WHERE id = ?", (relation_id,)
+            ).fetchone()
+        return self._relation_payload(updated)
+
+    def list_relation_decisions(self, limit: int = 100) -> list[dict]:
+        safe_limit = min(max(int(limit), 1), 300)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM relation_decisions ORDER BY decided_at DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["source"] = json.loads(item.pop("source_snapshot_json", "{}") or "{}")
+            item["target"] = json.loads(item.pop("target_snapshot_json", "{}") or "{}")
+            item["evidence"] = json.loads(item.pop("path_snapshot_json", "{}") or "{}")
+            result.append(item)
+        return result
 
     def replace_granularity_candidates(self, candidates: list[dict]) -> None:
         now = utc_now()
         with self._lock, self._connection:
+            # Granularity suggestions are derived from the current active
+            # knowledge scope. Rebuild pending candidates from scratch so
+            # excluded or deleted notes cannot survive as stale suggestions.
+            # Preserve explicit user decisions (rejected/confirmed/applied).
+            self._connection.execute(
+                "DELETE FROM granularity_candidates WHERE status = 'candidate'"
+            )
             for candidate in candidates:
                 signature = json.dumps(
                     [candidate["kind"], sorted(candidate["source_ids"])],
@@ -1604,6 +2289,32 @@ class ReflectionDatabase:
                 "DELETE FROM knowledge_hierarchy WHERE parent_id = ? OR child_id = ?",
                 (knowledge_id, knowledge_id),
             )
+            component_ids = [
+                row["id"]
+                for row in self._connection.execute(
+                    "SELECT id FROM knowledge_components WHERE knowledge_id = ?",
+                    (knowledge_id,),
+                ).fetchall()
+            ]
+            self._connection.execute(
+                "DELETE FROM knowledge_claims WHERE knowledge_id = ?", (knowledge_id,)
+            )
+            self._connection.execute(
+                "DELETE FROM knowledge_components WHERE knowledge_id = ?", (knowledge_id,)
+            )
+            if component_ids:
+                self._connection.executemany(
+                    "DELETE FROM kc_states WHERE kc_id = ?",
+                    [(item,) for item in component_ids],
+                )
+                self._connection.executemany(
+                    "DELETE FROM kc_evidence WHERE kc_id = ?",
+                    [(item,) for item in component_ids],
+                )
+            self._connection.execute(
+                "DELETE FROM insight_paths WHERE source_id = ? OR target_id = ?",
+                (knowledge_id, knowledge_id),
+            )
 
     @staticmethod
     def _learning_event_payload(row: sqlite3.Row | dict) -> dict:
@@ -1611,6 +2322,12 @@ class ReflectionDatabase:
         for key in ("independent_recall", "knowledge_changed"):
             if value.get(key) is not None:
                 value[key] = bool(value[key])
+        value["target_kc_ids"] = json.loads(
+            value.pop("target_kc_ids_json", "[]") or "[]"
+        )
+        value["misconceptions"] = json.loads(
+            value.pop("misconceptions_json", "[]") or "[]"
+        )
         return value
 
     @staticmethod
@@ -1707,6 +2424,14 @@ class ReflectionDatabase:
         value["tags"] = json.loads(value.pop("tags_json", "[]") or "[]")
         value["search_indexed"] = bool(value.pop("search_text", ""))
         value["managed"] = value.get("source") == "liora"
+        return value
+
+    @staticmethod
+    def _relation_payload(row: sqlite3.Row) -> dict:
+        value = dict(row)
+        value["category"] = value.get("category") or "knowledge"
+        value["evidence"] = json.loads(value.pop("evidence_json", "{}") or "{}")
+        value["features"] = json.loads(value.pop("features_json", "{}") or "{}")
         return value
 
     @staticmethod

@@ -71,6 +71,8 @@ class KnowledgeVaultTests(unittest.TestCase):
         self.assertEqual(parsed["title"], "真正标题")
         self.assertEqual(parsed["content"]["core_insight"], "真正的知识内容。")
         self.assertNotIn("loria", parsed["content"]["core_insight"].casefold())
+        self.assertNotIn("loria", parsed["search_text"].casefold())
+        self.assertNotIn("核心理解", parsed["search_text"])
 
     def test_every_markdown_is_a_knowledge_object_without_requiring_markers(self) -> None:
         ordinary = parse_markdown("# 普通笔记\n\n只是随手记录。", "fallback")
@@ -115,6 +117,67 @@ class KnowledgeVaultTests(unittest.TestCase):
         self.assertEqual(renamed["active"], 1)
         self.assertEqual(after["id"], item["id"])
         self.assertEqual(after["relative_path"], "Notes/Dynamic attention.md")
+
+    def test_scan_ignores_copilot_agent_resources_at_any_depth(self) -> None:
+        note = self.vault_path / "Notes" / "Mine.md"
+        root_skill = self.vault_path / "Copilot" / "skills" / "agent.md"
+        nested_skill = self.vault_path / "Resources" / "copilot" / "prompt.md"
+        note.parent.mkdir()
+        root_skill.parent.mkdir(parents=True)
+        nested_skill.parent.mkdir(parents=True)
+        note.write_text("# My knowledge\n", encoding="utf-8")
+        root_skill.write_text("# Agent skill\n", encoding="utf-8")
+        nested_skill.write_text("# Agent prompt\n", encoding="utf-8")
+
+        report = self.vault.scan()
+        documents = self.database.list_knowledge_documents()
+
+        self.assertEqual(report["scanned"], 1)
+        self.assertEqual([item["relative_path"] for item in documents], ["Notes/Mine.md"])
+
+    def test_scan_ignores_copilot_agent_skill_mirror_directories(self) -> None:
+        for directory in (".agents", ".claude", ".opencode"):
+            skill = self.vault_path / directory / "skills" / "agent.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("# Agent skill mirror\n", encoding="utf-8")
+        note = self.vault_path / "Notes" / "Mine.md"
+        note.parent.mkdir()
+        note.write_text("# My knowledge\n", encoding="utf-8")
+
+        report = self.vault.scan()
+
+        self.assertEqual(report["scanned"], 1)
+        self.assertEqual(
+            [item["relative_path"] for item in self.database.list_knowledge_documents()],
+            ["Notes/Mine.md"],
+        )
+
+    def test_manual_scope_can_exclude_a_folder_and_override_an_excluded_parent(self) -> None:
+        notes = self.vault_path / "Notes"
+        private = notes / "Private"
+        restored = private / "Shared"
+        restored.mkdir(parents=True)
+        (notes / "Public.md").write_text("# Public\n", encoding="utf-8")
+        (private / "Secret.md").write_text("# Secret\n", encoding="utf-8")
+        (restored / "Teach.md").write_text("# Teach\n", encoding="utf-8")
+
+        result = self.vault.set_scope(["Notes/Private/Shared"], ["Notes/Private"])
+        paths = [item["relative_path"] for item in self.database.list_knowledge_documents()]
+
+        self.assertEqual(result["scan"]["scanned"], 2)
+        self.assertEqual(paths, ["Notes/Private/Shared/Teach.md", "Notes/Public.md"])
+
+    def test_manual_scope_can_include_the_default_excluded_copilot_folder(self) -> None:
+        skill = self.vault_path / "Copilot" / "skills" / "agent.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("# Agent skill\n", encoding="utf-8")
+
+        self.vault.set_scope(["Copilot"], [])
+
+        self.assertEqual(
+            [item["relative_path"] for item in self.database.list_knowledge_documents()],
+            ["Copilot/skills/agent.md"],
+        )
 
     def test_migration_is_idempotent_and_creates_a_consistent_backup(self) -> None:
         service = ReflectionService(self.database)
@@ -269,11 +332,13 @@ class KnowledgeVaultTests(unittest.TestCase):
         self.assertEqual(dashboard["open_questions"][0]["question"], "为什么要除以根号 dk？")
 
         prompts = service.reflection_prompts()
-        self.assertEqual(prompts["total"], 1)
-        self.assertEqual(prompts["items"][0]["kind"], "knowledge_gap")
-        self.assertEqual(prompts["items"][0]["prompt"], "为什么要除以根号 dk？")
-        self.assertEqual(prompts["items"][0]["reason_code"], "open_question")
-        self.assertIn("Liora没有额外猜测", prompts["items"][0]["reason"])
+        open_prompt = next(
+            item for item in prompts["items"]
+            if item["reason_code"] == "open_question"
+        )
+        self.assertEqual(open_prompt["kind"], "open_question")
+        self.assertEqual(open_prompt["prompt"], "为什么要除以根号 dk？")
+        self.assertTrue(any(item["kind"] == "diagnostic" for item in prompts["items"]))
 
     def test_existing_document_index_schema_is_upgraded_without_data_loss(self) -> None:
         root = Path(self.temporary.name)

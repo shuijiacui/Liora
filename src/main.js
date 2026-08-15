@@ -63,7 +63,7 @@ let voiceService = null;
 let voiceReady = false;
 let dictationReady = false;
 let voiceMode = 'wake';
-let whisperStage = 'idle';
+let voiceTranscriptionStage = 'idle';
 let voiceError = '';
 let voiceRecognizer = '';
 let voiceRestartTimer = null;
@@ -372,7 +372,7 @@ function voiceStatus() {
     wakeEnabled: runtimeProfile.capabilities.wakeWord && readVoiceSettings().enabled,
     wakeReady: voiceService?.isReady() ?? voiceReady,
     mode: voiceMode,
-    stage: whisperStage,
+    stage: voiceTranscriptionStage,
     error: voiceError,
     recognizer: voiceRecognizer
   });
@@ -393,7 +393,7 @@ function resetDictationTimeout() {
 
 function returnToWakeMode() {
   voiceMode = 'wake';
-  whisperStage = 'idle';
+  voiceTranscriptionStage = 'idle';
   voiceReady = voiceService?.isReady() ?? false;
   resetDictationTimeout();
   sendVoiceStatus();
@@ -413,7 +413,7 @@ async function startDictation() {
   voiceCommandCoordinator?.cancel();
   clearTimeout(voiceRestartTimer);
   voiceMode = 'dictation';
-  whisperStage = 'loading';
+  voiceTranscriptionStage = 'loading';
   voiceError = '';
   voiceReady = false;
   await voiceService?.stop();
@@ -421,7 +421,7 @@ async function startDictation() {
   sendVoiceStatus();
   try {
     const status = await backendRequest('POST', '/api/voice/start', {});
-    whisperStage = status.state || whisperStage;
+    voiceTranscriptionStage = status.state || voiceTranscriptionStage;
     sendVoiceStatus();
   } catch (error) {
     voiceError = `本地语音转写启动失败：${error.message}`;
@@ -471,7 +471,7 @@ function handleBackendVoiceEvent(event) {
     return;
   }
   if (event.type !== 'voice-status') return;
-  whisperStage = event.state || whisperStage;
+  voiceTranscriptionStage = event.state || voiceTranscriptionStage;
   if (event.error) voiceError = event.error;
   sendVoiceStatus();
   if (voiceMode === 'dictation' && (event.state === 'idle' || event.state === 'error')) {
@@ -600,7 +600,7 @@ function setVoiceEnabled(enabled) {
     voiceCommandCoordinator?.cancel();
     voiceReady = false;
     voiceMode = 'wake';
-    whisperStage = 'idle';
+    voiceTranscriptionStage = 'idle';
     voiceError = '';
     void voiceService?.stop();
     void backendRequest('POST', '/api/voice/cancel', {}).catch(() => {});

@@ -27,3 +27,17 @@ class SemanticEmbeddingEngineTests(unittest.TestCase):
             engine = SemanticEmbeddingEngine(Path(directory))
             engine.embed_query("测试查询")
             self.assertFalse((Path(directory) / "embeddings").exists())
+
+    def test_release_drops_runtime_objects_and_allows_lazy_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            engine = SemanticEmbeddingEngine(Path(directory))
+            engine._session = object()
+            engine._tokenizer = object()
+            engine._attempted = True
+
+            engine.release()
+
+            self.assertFalse(engine.using_semantic_model)
+            self.assertIsNone(engine._tokenizer)
+            self.assertFalse(engine._attempted)
+            self.assertEqual(engine.status()["idle_release_seconds"], 300)

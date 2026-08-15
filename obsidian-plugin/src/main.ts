@@ -9,7 +9,9 @@ import { normalizeMemos } from "./memo-model";
 const DEFAULT_SETTINGS: LioraSettings = {
   engineUrl: "",
   accessToken: "",
-  memos: []
+  memos: [],
+  includedFolders: [],
+  excludedFolders: []
 };
 
 export default class LioraKnowledgePlugin extends Plugin {
@@ -75,7 +77,9 @@ export default class LioraKnowledgePlugin extends Plugin {
     this.settings = {
       ...DEFAULT_SETTINGS,
       ...(stored ?? {}),
-      memos: normalizeMemos(stored?.memos)
+      memos: normalizeMemos(stored?.memos),
+      includedFolders: Array.isArray(stored?.includedFolders) ? stored.includedFolders.map(String) : [],
+      excludedFolders: Array.isArray(stored?.excludedFolders) ? stored.excludedFolders.map(String) : []
     };
   }
 
@@ -99,5 +103,11 @@ export default class LioraKnowledgePlugin extends Plugin {
     await this.saveData(this.settings);
     const view = this.app.workspace.getLeavesOfType(LIORA_HOME_VIEW)[0]?.view;
     if (view instanceof LioraHomeView) await view.render();
+  }
+
+  async saveKnowledgeScope(includedFolders: string[], excludedFolders: string[]): Promise<void> {
+    this.settings.includedFolders = includedFolders;
+    this.settings.excludedFolders = excludedFolders;
+    await this.saveSettings();
   }
 }

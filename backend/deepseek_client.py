@@ -80,6 +80,97 @@ ALIGNMENT_PROMPT = """你是 Liora 的知识对齐裁判。你的任务不是写
 }
 """
 
+COGNITIVE_PROFILE_PROMPT = """你是 Liora 的认知模式分析器。请判断一篇知识中实际使用了哪些思考动作，而不是判断它讨论什么主题。
+
+只允许使用这些模式 ID：
+- decomposition：分解问题
+- abstraction：抽象与建模
+- classification：分类与分层
+- causal_reasoning：因果推理
+- comparison：对比与排除
+- hypothesis_test：假设与验证
+- local_to_global：局部到整体
+- iteration：递归与迭代
+- tradeoff：权衡与优化
+- boundary：边界分析
+- analogy：类比迁移
+- feedback：反馈修正
+
+严格规则：
+- 每个模式必须附带输入原文中的连续原句，不能概括或改写 evidence。
+- 内容仅仅有列表、标题或 Liora 模板，不代表使用了某种思维方式。
+- 没有足够证据时 patterns 返回空数组；不要为了丰富结果而联想。
+- problem_structure 只描述问题如何被处理，不复述主题；无法判断时返回空字符串。
+- 只返回严格 JSON，不要 Markdown：
+{
+  "patterns": [
+    {"id": "decomposition", "description": "如何体现该思考动作", "evidence": "输入中的连续原句", "section": "logic_chain", "confidence": 0.0}
+  ],
+  "problem_structure": ""
+}
+"""
+
+LEARNING_STRUCTURE_PROMPT = """你是 Liora 的知识命题抽取器。请从输入片段中抽取可用于学习诊断和严格路径推理的命题。
+
+只允许类型：assertion、definition、causal、prerequisite、boundary、method、example、contradiction、question、reasoning_step、connection。
+
+严格规则：
+- evidence 必须是输入某一片段中的连续原文，不能概括、拼接或改写；
+- causal 必须给出明确 subject（原因）、object（结果），mechanism 只填原文明确说明的机制；
+- prerequisite 必须给出前置 subject 和目标 object；
+- conditions 只保留原文明示的条件；
+- 不因为出现“因为、所以、导致”等词就强行抽取完整因果链；
+- 不抽取思维风格、主题标签、模板标题或格式标记；
+- 没有足够证据时 claims 返回空数组；
+- 每篇最多 24 条，只返回严格 JSON：
+{
+  "claims": [
+    {
+      "type": "causal",
+      "subject": "",
+      "predicate": "causes",
+      "object": "",
+      "mechanism": "",
+      "conditions": [],
+      "polarity": "positive | negative",
+      "evidence": "输入中的连续原文"
+    }
+  ],
+  "components": []
+}
+"""
+
+PATH_VERIFIER_PROMPT = """你是 Liora 的学习路径反向审查器。输入中的候选已经过本地召回，但你必须主动寻找拒绝理由。
+
+逐条检查：
+1. 前一步输出是否真的等价或蕴含后一步输入；
+2. 是否存在方向反转、极性冲突、时间/范围/层级/适用条件不兼容；
+3. 是否依赖没有写出的关键前提；
+4. 是否只是主题相似、共同词语、共同表达方式或明显重复；
+5. 组合后是否产生具体的新解释、预测、决策边界或行动；
+6. 这条解释是否泛化到大量无关文本；若是则拒绝。
+
+只能使用输入证据，不得补充外部事实。允许全部拒绝。返回严格 JSON：
+{
+  "decisions": [
+    {
+      "canonical_key": "",
+      "decision": "PASS | REJECT",
+      "reason_code": "valid | broken_bridge | missing_premise | wrong_direction | incompatible_scope | obvious | generic | ungrounded",
+      "reason": "",
+      "learning_payoff": "",
+      "failure_conditions": []
+    }
+  ]
+}
+"""
+
+COGNITIVE_PATTERN_IDS = {
+    "decomposition", "abstraction", "classification", "causal_reasoning",
+    "comparison", "hypothesis_test", "local_to_global", "iteration",
+    "tradeoff", "boundary", "analogy", "feedback",
+}
+
 
 class DeepSeekError(RuntimeError):
     pass
@@ -88,6 +179,7 @@ class DeepSeekError(RuntimeError):
 class DeepSeekClient:
     def __init__(self, settings: DeepSeekSettings):
         self.settings = settings
+        self.last_usage: dict = {}
 
     @property
     def configured(self) -> bool:
@@ -244,6 +336,156 @@ class DeepSeekClient:
             "needs_human_review": bool(value.get("needs_human_review", True)),
         }
 
+    def analyze_cognitive_profile(self, title: str, chunks: list[dict]) -> dict:
+        if not self.configured:
+            raise DeepSeekError("DeepSeek API Key 尚未配置。")
+        compact_chunks = [
+            {
+                "section": str(item.get("section") or "")[:80],
+                "text": str(item.get("text") or "")[:500],
+            }
+            for item in chunks[:36]
+            if str(item.get("text") or "").strip()
+        ]
+        messages = [
+            {"role": "system", "content": COGNITIVE_PROFILE_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"title": str(title or "")[:120], "chunks": compact_chunks},
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        raw = self._request(messages, temperature=0.0, max_tokens=1200)
+        value = self._parse_json(raw)
+        raw_patterns = value.get("patterns")
+        patterns = []
+        for item in raw_patterns if isinstance(raw_patterns, list) else []:
+            if not isinstance(item, dict):
+                continue
+            pattern_id = str(item.get("id") or "").strip()
+            evidence = " ".join(str(item.get("evidence") or "").split()).strip()
+            if pattern_id not in COGNITIVE_PATTERN_IDS or len(evidence) < 8:
+                continue
+            matched_chunk = next(
+                (
+                    chunk
+                    for chunk in compact_chunks
+                    if evidence in " ".join(chunk["text"].split())
+                ),
+                None,
+            )
+            if not matched_chunk:
+                continue
+            try:
+                confidence = min(max(float(item.get("confidence") or 0), 0.0), 1.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if confidence < 0.58:
+                continue
+            patterns.append(
+                {
+                    "id": pattern_id,
+                    "description": str(item.get("description") or "").strip()[:500],
+                    "evidence": evidence[:360],
+                    "section": matched_chunk["section"],
+                    "confidence": round(confidence, 4),
+                }
+            )
+        seen = set()
+        unique = []
+        for item in patterns:
+            if item["id"] in seen:
+                continue
+            seen.add(item["id"])
+            unique.append(item)
+        return {
+            "patterns": unique[:6],
+            "problem_structure": str(value.get("problem_structure") or "").strip()[:600],
+            "provider": "deepseek-schema-evidence",
+        }
+
+    def analyze_learning_structure(self, title: str, chunks: list[dict]) -> dict:
+        if not self.configured:
+            raise DeepSeekError("DeepSeek API Key 尚未配置。")
+        compact_chunks = [
+            {
+                "section": str(item.get("section") or "")[:80],
+                "text": str(item.get("text") or "")[:450],
+            }
+            for item in chunks[:20]
+            if str(item.get("text") or "").strip()
+        ]
+        messages = [
+            {"role": "system", "content": LEARNING_STRUCTURE_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"title": str(title or "")[:120], "chunks": compact_chunks},
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        raw = self._request(messages, temperature=0.0, max_tokens=1000)
+        value = self._parse_json(raw)
+        claims = value.get("claims")
+        return {
+            "claims": claims[:24] if isinstance(claims, list) else [],
+            "components": [],
+            "model": f"deepseek:{self.settings.model}:grounded-claims-v1",
+        }
+
+    def verify_learning_paths(self, candidates: list[dict]) -> dict[str, dict]:
+        if not self.configured:
+            raise DeepSeekError("DeepSeek API Key 尚未配置。")
+        compact = []
+        for item in candidates[:3]:
+            evidence = item.get("evidence") or {}
+            key = str((item.get("features") or {}).get("canonical_key") or "")
+            if not key:
+                continue
+            compact.append({
+                "canonical_key": key,
+                "relation_type": str(item.get("label") or "")[:80],
+                "source_excerpt": str(evidence.get("source_excerpt") or "")[:500],
+                "target_excerpt": str(evidence.get("target_excerpt") or "")[:500],
+                "bridge": str(evidence.get("bridge") or "")[:240],
+                "proposed_payoff": str(evidence.get("learning_payoff") or item.get("reason") or "")[:600],
+                "failure_conditions": [str(value)[:300] for value in (evidence.get("failure_conditions") or [])[:5]],
+            })
+        if not compact:
+            return {}
+        raw = self._request(
+            [
+                {"role": "system", "content": PATH_VERIFIER_PROMPT},
+                {"role": "user", "content": json.dumps({"candidates": compact}, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            max_tokens=700,
+        )
+        value = self._parse_json(raw)
+        allowed = {item["canonical_key"] for item in compact}
+        decisions: dict[str, dict] = {}
+        for item in value.get("decisions") if isinstance(value.get("decisions"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("canonical_key") or "")
+            decision = str(item.get("decision") or "").upper()
+            if key not in allowed or decision not in {"PASS", "REJECT"}:
+                continue
+            decisions[key] = {
+                "decision": decision,
+                "reason_code": str(item.get("reason_code") or "")[:80],
+                "reason": str(item.get("reason") or "")[:800],
+                "learning_payoff": str(item.get("learning_payoff") or "")[:800],
+                "failure_conditions": [
+                    str(condition)[:300]
+                    for condition in (item.get("failure_conditions") or [])[:6]
+                ],
+            }
+        return decisions
+
     @staticmethod
     def _parse_json(raw: str) -> dict:
         try:
@@ -255,6 +497,7 @@ class DeepSeekClient:
             raise DeepSeekError("DeepSeek 返回的知识整理格式无效。") from error
 
     def _request(self, messages: list[dict], temperature: float, max_tokens: int) -> str:
+        self.last_usage = {}
         payload = {
             "model": self.settings.model,
             "messages": messages,
@@ -293,6 +536,20 @@ class DeepSeekClient:
             raise DeepSeekError("DeepSeek 返回结果中没有可用的回复。") from error
         if not content:
             raise DeepSeekError("DeepSeek 返回了空回复。")
+        usage = result.get("usage") if isinstance(result, dict) else {}
+        prompt_details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else {}
+        self.last_usage = {
+            "prompt_tokens": int((usage or {}).get("prompt_tokens") or 0),
+            "prompt_cache_hit_tokens": int(
+                (usage or {}).get("prompt_cache_hit_tokens")
+                or (prompt_details or {}).get("cached_tokens")
+                or 0
+            ),
+            "prompt_cache_miss_tokens": int(
+                (usage or {}).get("prompt_cache_miss_tokens") or 0
+            ),
+            "completion_tokens": int((usage or {}).get("completion_tokens") or 0),
+        }
         return content
 
     @staticmethod

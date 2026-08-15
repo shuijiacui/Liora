@@ -5,9 +5,9 @@ Liora 的安装包是源代码的构建产物，不会替代或锁定 `D:\Liora`
 ## 两套本地语音模型
 
 - `.models/vosk/`：只用于低延迟、常驻的中英文唤醒词识别（“Hi Liora”）。
-- `.models/faster-whisper/`：用于唤醒后自然语句的意图转写，以及点击“说完了”后的完整中英文听写。
+- `.models/sensevoice/`：SenseVoice-Small INT8 ONNX，用于唤醒后的语音命令和点击“说完了”后的完整多语言听写。
 
-它们承担的任务不同，与是否部署到硬件无关。当前 Windows 安装包保留了唤醒和听写两项能力，因此同时携带两套模型。如果以后不需要语音唤醒，可以移除 Vosk 监听和模型；如果不需要语音输入，可以进一步移除 faster-whisper。
+它们承担的任务不同，与是否部署到硬件无关。当前 Windows 安装包保留了唤醒和听写两项能力，因此同时携带两套模型。SenseVoice 使用单一 INT8 引擎，不再携带 Whisper 回退、PyTorch、CTranslate2 或 PyAV；空闲 180 秒后会卸载模型。如果以后不需要语音唤醒，可以移除 Vosk 监听和模型；如果不需要语音输入，可以进一步移除 SenseVoice。
 
 ## 首次准备
 

@@ -37,7 +37,7 @@ function findPython() {
     if (!path.isAbsolute(candidate) || !fs.existsSync(candidate)) return false;
     const check = spawnSync(
       candidate,
-      ['-c', 'import PyInstaller, faster_whisper, sounddevice, vosk, opencc'],
+      ['-c', 'import PyInstaller, kaldi_native_fbank, onnxruntime, sounddevice, vosk, opencc'],
       { cwd: projectRoot, windowsHide: true, stdio: 'ignore' }
     );
     return check.status === 0;

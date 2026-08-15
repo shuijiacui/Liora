@@ -1,6 +1,7 @@
 import math
 import os
 import threading
+import gc
 from pathlib import Path
 
 from knowledge_intelligence import embed_text
@@ -35,11 +36,14 @@ class SemanticEmbeddingEngine:
         )
         self.max_length = self._bounded_int("LIORA_EMBEDDING_MAX_LENGTH", 512, 64, 512)
         self.batch_size = self._bounded_int("LIORA_EMBEDDING_BATCH_SIZE", 8, 1, 32)
+        self.idle_seconds = self._bounded_int("LIORA_EMBEDDING_IDLE_SECONDS", 300, 30, 3600)
         self._lock = threading.RLock()
         self._session = None
         self._tokenizer = None
         self._attempted = False
         self._error: str | None = None
+        self._idle_timer: threading.Timer | None = None
+        self._idle_generation = 0
 
     @staticmethod
     def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -85,6 +89,7 @@ class SemanticEmbeddingEngine:
             "available": self.available,
             "loaded": self.using_semantic_model,
             "dimensions": 512 if self.model_name.startswith("bge-") else 384,
+            "idle_release_seconds": self.idle_seconds,
             "error": self._error,
         }
 
@@ -104,7 +109,10 @@ class SemanticEmbeddingEngine:
         never combines cached 512-dimensional BGE vectors with 384-dimensional
         fallback query vectors.
         """
-        return self._ensure_loaded()
+        loaded = self._ensure_loaded()
+        if loaded:
+            self._schedule_idle_release()
+        return loaded
 
     def _embed(self, text: str, is_query: bool) -> list[float]:
         return self._embed_many([text], is_query=is_query)[0]
@@ -123,6 +131,7 @@ class SemanticEmbeddingEngine:
             with self._lock:
                 for start in range(0, len(prepared), self.batch_size):
                     vectors.extend(self._run_batch(prepared[start : start + self.batch_size]))
+            self._schedule_idle_release()
             return vectors
         except Exception as error:
             # A broken or incompatible local model must never take down the
@@ -131,7 +140,47 @@ class SemanticEmbeddingEngine:
                 self._error = f"{type(error).__name__}: {str(error)[:240]}"
                 self._session = None
                 self._tokenizer = None
+                self._cancel_idle_release_locked()
             return [embed_text(text) for text in texts]
+
+    def release(self) -> None:
+        """Release ONNX/tokenizer memory while keeping cached vectors usable."""
+        with self._lock:
+            self._cancel_idle_release_locked()
+            self._session = None
+            self._tokenizer = None
+            # A deliberate idle release may load again on the next query.
+            self._attempted = False
+        gc.collect()
+
+    def _cancel_idle_release_locked(self) -> None:
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _schedule_idle_release(self) -> None:
+        with self._lock:
+            if self._session is None:
+                return
+            self._cancel_idle_release_locked()
+            self._idle_generation += 1
+            generation = self._idle_generation
+            timer = threading.Timer(
+                self.idle_seconds, self._release_if_idle, args=(generation,)
+            )
+            timer.daemon = True
+            self._idle_timer = timer
+            timer.start()
+
+    def _release_if_idle(self, generation: int) -> None:
+        with self._lock:
+            if generation != self._idle_generation:
+                return
+            self._cancel_idle_release_locked()
+            self._session = None
+            self._tokenizer = None
+            self._attempted = False
+        gc.collect()
 
     def _ensure_loaded(self) -> bool:
         with self._lock:

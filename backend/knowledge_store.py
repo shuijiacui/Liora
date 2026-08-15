@@ -11,7 +11,13 @@ from pathlib import Path
 from database import ReflectionDatabase, utc_now
 
 
-IGNORED_DIRECTORIES = {".git", ".obsidian", ".trash", "node_modules", "templates"}
+# Directories that contain application or agent resources rather than the
+# user's own knowledge. Matching is case-insensitive and applies at any depth.
+ALWAYS_IGNORED_DIRECTORIES = {
+    ".git", ".obsidian", ".trash", "node_modules",
+    ".agents", ".claude", ".opencode",
+}
+DEFAULT_EXCLUDED_DIRECTORY_NAMES = {"copilot", "templates"}
 # Accept the canonical marker and historical/malformed variants such as
 # ``<!-- loria:begin -->`` and ``<!loria-begin->``. Marker spelling is
 # metadata, never knowledge content.
@@ -204,6 +210,25 @@ def parse_markdown(text: str, fallback_title: str) -> dict:
             generic.extend(_clean_lines(lines))
         core_lines = generic[:8]
 
+    content = {
+        "title": title,
+        "core_insight": "\n".join(core_lines).strip(),
+        "key_points": _clean_lines(find_section(aliases["key_points"])),
+        "logic_chain": _clean_lines(find_section(aliases["logic_chain"])),
+        "examples": _clean_lines(find_section(aliases["examples"])),
+        "extensions": _clean_lines(find_section(aliases["extensions"])),
+        "boundaries": _clean_lines(find_section(aliases["boundaries"])),
+        "connections": _clean_lines(find_section(aliases["connections"])),
+        "open_questions": _clean_lines(find_section(aliases["open_questions"])),
+        "next_step": "\n".join(_clean_lines(find_section(aliases["next_step"]))).strip(),
+        "sources": _parse_sources(find_section(aliases["sources"])),
+    }
+    canonical_search = [title, content["core_insight"]]
+    for key in ("key_points", "logic_chain", "examples", "extensions", "boundaries", "connections", "open_questions"):
+        canonical_search.extend(content[key])
+    if content["next_step"]:
+        canonical_search.append(content["next_step"])
+
     return {
         "id": str(metadata.get("liora_id") or metadata.get("id") or "").strip(),
         "title": title,
@@ -213,20 +238,11 @@ def parse_markdown(text: str, fallback_title: str) -> dict:
         "source": declared_source,
         "object_type": object_type,
         "tags": tags,
-        "search_text": "\n".join((title, body)).strip(),
-        "content": {
-            "title": title,
-            "core_insight": "\n".join(core_lines).strip(),
-            "key_points": _clean_lines(find_section(aliases["key_points"])),
-            "logic_chain": _clean_lines(find_section(aliases["logic_chain"])),
-            "examples": _clean_lines(find_section(aliases["examples"])),
-            "extensions": _clean_lines(find_section(aliases["extensions"])),
-            "boundaries": _clean_lines(find_section(aliases["boundaries"])),
-            "connections": _clean_lines(find_section(aliases["connections"])),
-            "open_questions": _clean_lines(find_section(aliases["open_questions"])),
-            "next_step": "\n".join(_clean_lines(find_section(aliases["next_step"]))).strip(),
-            "sources": _parse_sources(find_section(aliases["sources"])),
-        },
+        # FTS indexes canonical knowledge rather than frontmatter, comments or
+        # Liora's managed-block markers. The original Markdown remains in the
+        # Vault and is never rewritten merely for indexing.
+        "search_text": "\n".join(value for value in canonical_search if value).strip(),
+        "content": content,
     }
 
 
@@ -351,21 +367,106 @@ def _update_liora_frontmatter(text: str, item: dict) -> str:
 
 
 class KnowledgeVault:
-    def __init__(self, database: ReflectionDatabase, vault_path: Path, backup_dir: Path):
+    def __init__(
+        self,
+        database: ReflectionDatabase,
+        vault_path: Path,
+        backup_dir: Path,
+        scope_config_path: Path | None = None,
+    ):
         self.database = database
         self.vault_path = Path(vault_path).expanduser().resolve()
         self.backup_dir = Path(backup_dir)
+        self.scope_config_path = Path(scope_config_path) if scope_config_path else None
+        self._included_folders: list[str] = []
+        self._excluded_folders: list[str] = []
         self._last_scan_at = 0.0
         self._last_scan_report: dict | None = None
         if not self.vault_path.is_dir():
             raise ValueError("选择的 Obsidian Vault 不存在或不是文件夹。")
+        self._load_scope()
 
     def status(self) -> dict:
         return {
             "configured": True,
             "vault_path": str(self.vault_path),
             "indexed_count": self.database.count_knowledge_documents(),
+            "scope": self.scope(),
         }
+
+    @staticmethod
+    def _normalize_scope_folder(value: str) -> str:
+        raw = str(value or "").strip().replace("\\", "/").strip("/")
+        parts = [part.strip() for part in raw.split("/") if part.strip() and part.strip() != "."]
+        if not parts or any(part == ".." for part in parts):
+            return ""
+        return "/".join(parts)
+
+    def _normalize_scope_values(self, values) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        result: dict[str, str] = {}
+        for value in values:
+            folder = self._normalize_scope_folder(str(value or ""))
+            if folder:
+                result[folder.casefold()] = folder
+        return sorted(result.values(), key=str.casefold)
+
+    def _load_scope(self) -> None:
+        if not self.scope_config_path or not self.scope_config_path.is_file():
+            return
+        try:
+            payload = json.loads(self.scope_config_path.read_text(encoding="utf-8"))
+            configured_vault = Path(str(payload.get("vault_path") or "")).expanduser().resolve()
+            if configured_vault != self.vault_path:
+                return
+            self._included_folders = self._normalize_scope_values(payload.get("included_folders"))
+            self._excluded_folders = self._normalize_scope_values(payload.get("excluded_folders"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            self._included_folders = []
+            self._excluded_folders = []
+
+    def scope(self) -> dict:
+        return {
+            "included_folders": list(self._included_folders),
+            "excluded_folders": list(self._excluded_folders),
+            "default_excluded_names": sorted(DEFAULT_EXCLUDED_DIRECTORY_NAMES),
+        }
+
+    def set_scope(self, included_folders, excluded_folders) -> dict:
+        included = self._normalize_scope_values(included_folders)
+        excluded = self._normalize_scope_values(excluded_folders)
+        included_keys = {value.casefold() for value in included}
+        self._included_folders = included
+        self._excluded_folders = [value for value in excluded if value.casefold() not in included_keys]
+        if self.scope_config_path:
+            payload = {
+                "vault_path": str(self.vault_path),
+                "included_folders": self._included_folders,
+                "excluded_folders": self._excluded_folders,
+            }
+            self._atomic_write(self.scope_config_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        return {"scope": self.scope(), "scan": self.scan(force=True)}
+
+    def _folder_is_managed(self, relative: Path) -> bool:
+        directories = list(relative.parts[:-1])
+        folded = [part.casefold() for part in directories]
+        if any(part in ALWAYS_IGNORED_DIRECTORIES for part in folded):
+            return False
+
+        folder = "/".join(directories).casefold()
+        matches: list[tuple[int, bool]] = []
+        for value in self._included_folders:
+            rule = value.casefold()
+            if folder == rule or folder.startswith(rule + "/"):
+                matches.append((rule.count("/") + 1, True))
+        for value in self._excluded_folders:
+            rule = value.casefold()
+            if folder == rule or folder.startswith(rule + "/"):
+                matches.append((rule.count("/") + 1, False))
+        if matches:
+            return max(matches, key=lambda item: (item[0], item[1]))[1]
+        return not any(part in DEFAULT_EXCLUDED_DIRECTORY_NAMES for part in folded)
 
     def _relative(self, path: Path) -> str:
         resolved = path.resolve()
@@ -398,7 +499,7 @@ class KnowledgeVault:
         files = []
         for path in self.vault_path.rglob("*.md"):
             relative = path.relative_to(self.vault_path)
-            if any(part.casefold() in IGNORED_DIRECTORIES for part in relative.parts[:-1]):
+            if not self._folder_is_managed(relative):
                 continue
             if path.is_file():
                 files.append(path)

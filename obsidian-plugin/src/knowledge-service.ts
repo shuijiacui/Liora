@@ -17,13 +17,21 @@ import {
   ReflectionPrompt
 } from "./question-card-model";
 import type { LioraMemo } from "./memo-model";
-import { buildRelationEvidence, type RelationEvidence } from "./relation-evidence-model";
+import { buildRelationEvidence, normalizeRelationEvidence, type RelationEvidence } from "./relation-evidence-model";
 import { comparableVaultPath, vaultPathCandidates } from "./vault-path-model";
+import { isIgnoredKnowledgePath } from "./knowledge-path-filter";
 
 export interface LioraSettings {
   engineUrl: string;
   accessToken: string;
   memos: LioraMemo[];
+  includedFolders: string[];
+  excludedFolders: string[];
+}
+
+export interface KnowledgeScope {
+  includedFolders: string[];
+  excludedFolders: string[];
 }
 
 export interface PromptActionResult {
@@ -44,13 +52,29 @@ export interface ChangeSet {
 
 export interface KnowledgeRelation {
   id: string;
-  kind: "hard" | "soft";
+  kind: "hard" | "typed" | "cognitive" | "inspiration" | "soft";
+  category?: "knowledge" | "cognitive" | "inspiration";
+  label?: string;
   confidence: number;
   reason: string;
   status: string;
   source: { id?: string; title?: string; relative_path?: string };
   target: { id?: string; title?: string; relative_path?: string };
   evidence?: RelationEvidence;
+}
+
+export interface RelationDecision {
+  id: string;
+  relation_id: string;
+  canonical_key: string;
+  action: "confirmed" | "rejected" | "restored";
+  reason_code: string;
+  source: { id?: string; title?: string; relative_path?: string };
+  target: { id?: string; title?: string; relative_path?: string };
+  evidence?: RelationEvidence;
+  learning_payoff?: string;
+  pipeline_version?: string;
+  decided_at: string;
 }
 
 export interface GranularityCandidate {
@@ -176,7 +200,7 @@ export class KnowledgeService {
   }
 
   async loadRelations(): Promise<KnowledgeRelation[]> {
-    const payload = await this.engineRequest("/api/relations?limit=100") as { items?: KnowledgeRelation[] };
+    const payload = await this.engineRequest("/api/relations?status=candidate&limit=100") as { items?: KnowledgeRelation[] };
     if (!Array.isArray(payload.items)) return [];
     const markdown = new Map<string, Promise<string>>();
     const read = (path: string): Promise<string> => {
@@ -187,6 +211,7 @@ export class KnowledgeService {
       return markdown.get(path) ?? Promise.resolve("");
     };
     return await Promise.all(payload.items.map(async (item) => {
+      item.evidence = normalizeRelationEvidence(item.evidence);
       if (item.evidence?.sourceExcerpt && item.evidence?.targetExcerpt) return item;
       const sourcePath = item.source?.relative_path ?? "";
       const targetPath = item.target?.relative_path ?? "";
@@ -202,8 +227,24 @@ export class KnowledgeService {
     }));
   }
 
-  async updateRelation(id: string, action: "confirm" | "reject"): Promise<void> {
-    await this.engineRequest(`/api/relations/${encodeURIComponent(id)}/${action}`, "POST", {});
+  async loadRelationDecisions(): Promise<RelationDecision[]> {
+    try {
+      const payload = await this.engineRequest("/api/relation-decisions?limit=100") as { items?: RelationDecision[] };
+      if (!Array.isArray(payload.items)) return [];
+      return payload.items.map((item) => ({ ...item, evidence: normalizeRelationEvidence(item.evidence) }));
+    } catch {
+      // During a rolling upgrade the plugin may start before the desktop
+      // runtime has been replaced. Keep the manager usable until restart.
+      return [];
+    }
+  }
+
+  async updateRelation(
+    id: string,
+    action: "confirm" | "reject" | "restore",
+    reasonCode = action === "confirm" ? "learning_value_confirmed" : action === "reject" ? "not_useful_now" : "reconsider"
+  ): Promise<void> {
+    await this.engineRequest(`/api/relations/${encodeURIComponent(id)}/${action}`, "POST", { reason_code: reasonCode });
   }
 
   async loadGranularity(): Promise<GranularityCandidate[]> {
@@ -224,6 +265,29 @@ export class KnowledgeService {
 
   async askKnowledge(question: string): Promise<KnowledgeAnswer> {
     return await this.engineRequest("/api/knowledge/ask", "POST", { question }) as KnowledgeAnswer;
+  }
+
+  async loadKnowledgeScope(): Promise<KnowledgeScope> {
+    const payload = await this.engineRequest("/api/storage") as {
+      scope?: { included_folders?: unknown; excluded_folders?: unknown };
+    };
+    return {
+      includedFolders: Array.isArray(payload.scope?.included_folders)
+        ? payload.scope.included_folders.map(String) : [],
+      excludedFolders: Array.isArray(payload.scope?.excluded_folders)
+        ? payload.scope.excluded_folders.map(String) : []
+    };
+  }
+
+  async saveKnowledgeScope(scope: KnowledgeScope): Promise<void> {
+    await this.engineRequest("/api/storage/scope", "POST", {
+      included_folders: scope.includedFolders,
+      excluded_folders: scope.excludedFolders
+    });
+  }
+
+  private isManagedPath(path: string): boolean {
+    return !isIgnoredKnowledgePath(path, this.settings.includedFolders, this.settings.excludedFolders);
   }
 
   private async postPromptAction(
@@ -301,10 +365,9 @@ export class KnowledgeService {
   }
 
   private async loadFromVault(notice: string): Promise<DashboardData> {
-    // This plugin is installed in a dedicated Liora Vault, so every Markdown
-    // file is already a knowledge object. Metadata describes it but does not
-    // decide whether it is admitted into knowledge management.
-    const files = this.app.vault.getMarkdownFiles();
+    // Markdown in the dedicated Liora Vault is knowledge unless it lives in a
+    // known application/agent resource directory such as Copilot.
+    const files = this.app.vault.getMarkdownFiles().filter((file) => this.isManagedPath(file.path));
     const sorted = [...files].sort((left, right) => right.stat.mtime - left.stat.mtime);
     const recent = sorted.slice(0, 5).map((file): DashboardItem => {
       const cache = this.app.metadataCache.getFileCache(file);
@@ -358,11 +421,12 @@ export class KnowledgeService {
     const basePath = adapter.getBasePath?.() ?? "";
     const candidates = vaultPathCandidates(path, basePath);
     for (const candidate of candidates) {
+      if (!this.isManagedPath(candidate)) continue;
       const target = this.app.vault.getAbstractFileByPath(candidate);
       if (target instanceof TFile) return target;
     }
 
-    const files = this.app.vault.getMarkdownFiles();
+    const files = this.app.vault.getMarkdownFiles().filter((file) => this.isManagedPath(file.path));
     const comparableInput = comparableVaultPath(path);
     for (const file of files) {
       const comparableFile = comparableVaultPath(file.path);

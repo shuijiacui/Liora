@@ -198,6 +198,31 @@ class ReflectionApiTests(unittest.TestCase):
         self.assertEqual(answer["provider"], "local")
         self.assertEqual(answer["evidence"], [])
 
+    def test_relation_decisions_endpoint_archives_confirm_and_reject_actions(self) -> None:
+        self.database.replace_discovered_relations([{
+            "source_id": "source", "target_id": "target", "kind": "typed_path",
+            "category": "knowledge", "label": "causal_continuation",
+            "confidence": 0.92, "reason": "A → B → C", "status": "candidate",
+            "evidence": {
+                "source_excerpt": "A 导致 B", "target_excerpt": "B 导致 C",
+                "bridge": "B", "path": [{"evidence": "A 导致 B"}, {"evidence": "B 导致 C"}],
+                "learning_payoff": "连接两段因果链。", "failure_conditions": ["条件不同则不成立。"],
+            },
+            "features": {"canonical_key": "source-target-causal", "direction": ["source", "target"]},
+            "pipeline_version": "learning-engine-v4",
+        }])
+        relation_id = self.database.list_relations("candidate")[0]["id"]
+
+        self.request(
+            f"/api/relations/{relation_id}/confirm",
+            {"reason_code": "learning_value_confirmed"},
+        )
+        decisions = self.request("/api/relation-decisions?limit=10")
+
+        self.assertEqual(decisions["total"], 1)
+        self.assertEqual(decisions["items"][0]["action"], "confirmed")
+        self.assertEqual(decisions["items"][0]["evidence"]["bridge"], "B")
+
     def test_command_audio_is_transcribed_in_memory(self) -> None:
         calls = []
 

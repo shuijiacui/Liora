@@ -1,6 +1,6 @@
 {
   "name": "liora-knowledge-obsidian",
-  "version": "0.6.0",
+  "version": "0.8.0",
   "description": "Liora's Obsidian knowledge home and active-recall bridge.",
   "type": "module",
   "private": true,

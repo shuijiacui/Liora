@@ -70,6 +70,14 @@ class ReflectionHandler(BaseHTTPRequestHandler):
                         int(query.get("limit", ["100"])[0]),
                     ),
                 )
+            if route.path == "/api/relation-decisions":
+                query = parse_qs(route.query)
+                return self._json(
+                    200,
+                    self.server.service.relation_decisions(
+                        int(query.get("limit", ["100"])[0])
+                    ),
+                )
             if route.path == "/api/granularity":
                 query = parse_qs(route.query)
                 return self._json(
@@ -154,6 +162,13 @@ class ReflectionHandler(BaseHTTPRequestHandler):
                 return self._json(200, self.server.service.scan_vault())
             if route == "/api/storage/rebuild":
                 return self._json(200, self.server.service.rebuild_vault_index())
+            if route == "/api/storage/scope":
+                return self._json(
+                    200,
+                    self.server.service.update_vault_scope(
+                        body.get("included_folders"), body.get("excluded_folders")
+                    ),
+                )
             if route == "/api/storage/migrate":
                 return self._json(200, self.server.service.migrate_legacy_knowledge())
             if route == "/api/knowledge/ask":
@@ -173,11 +188,13 @@ class ReflectionHandler(BaseHTTPRequestHandler):
                     return self._json(200, self.server.service.rollback_changeset(changeset_id))
             if len(parts) == 4 and parts[:2] == ["api", "relations"]:
                 relation_id, action = parts[2], parts[3]
-                if action in {"confirm", "reject"}:
+                if action in {"confirm", "reject", "restore"}:
                     return self._json(
                         200,
                         self.server.service.update_relation(
-                            relation_id, "confirmed" if action == "confirm" else "rejected"
+                            relation_id,
+                            "confirmed" if action == "confirm" else "rejected" if action == "reject" else "candidate",
+                            str(body.get("reason_code") or ""),
                         ),
                     )
             if len(parts) == 4 and parts[:2] == ["api", "granularity"]:
@@ -246,6 +263,10 @@ class ReflectionHandler(BaseHTTPRequestHandler):
                             body.get("misconception_count")
                             if isinstance(body.get("misconception_count"), int)
                             else None,
+                            str(body.get("outcome") or "") or None,
+                            [str(item) for item in body.get("misconceptions", [])]
+                            if isinstance(body.get("misconceptions"), list)
+                            else None,
                         ),
                     )
 
@@ -312,7 +333,7 @@ def main() -> None:
         print(format_voice_event(payload), flush=True)
 
     models_dir = Path(args.models_dir) if args.models_dir else project_root / ".models"
-    voice_transcriber = VoiceTranscriber(models_dir / "faster-whisper", emit_voice_event)
+    voice_transcriber = VoiceTranscriber(models_dir / "sensevoice", emit_voice_event)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), ReflectionHandler)
     server.service = service
     server.voice_transcriber = voice_transcriber
@@ -334,6 +355,7 @@ def main() -> None:
         server.serve_forever(poll_interval=0.25)
     finally:
         voice_transcriber.stop(discard=True)
+        voice_transcriber.close()
         database.close()
         server.server_close()
 
